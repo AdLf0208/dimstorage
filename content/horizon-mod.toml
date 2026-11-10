@@ -1,0 +1,11 @@
+# Port-owned content mod for the DimStorage slice-1 dimensional chest.
+# Assets, recipes, loot and lang are the verified carry from
+# DimStorage-1.21.1-9.1.1.jar (Edivad99/DimStorage, AGPL-3.0-only); the
+# Rust is a clean-room rewrite. Local-only until publishing is approved
+# (ARCHITECTURE.md §8); AGPL source travels with any redistribution.
+id = "dimstorage"
+name = "DimStorage"
+version = "9.1.1"
+api = "0.2"
+side = "both"
+capabilities = ["registries"]

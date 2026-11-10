@@ -1,0 +1,17 @@
+{
+  "category": "misc",
+  "key": {
+    "a": "minecraft:iron_ingot",
+    "b": "dimstorage:dim_core"
+  },
+  "pattern": [
+    "aaa",
+    "aba",
+    "aaa"
+  ],
+  "result": {
+    "count": 1,
+    "id": "dimstorage:solid_dim_core"
+  },
+  "type": "minecraft:crafting_shaped"
+}

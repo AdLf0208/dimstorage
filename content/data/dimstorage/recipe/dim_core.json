@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "a": "minecraft:iron_ingot",
+    "b": "minecraft:redstone",
+    "c": "minecraft:diamond"
+  },
+  "pattern": [
+    "aba",
+    "bcb",
+    "aba"
+  ],
+  "result": {
+    "count": 1,
+    "id": "dimstorage:dim_core"
+  },
+  "type": "minecraft:crafting_shaped"
+}

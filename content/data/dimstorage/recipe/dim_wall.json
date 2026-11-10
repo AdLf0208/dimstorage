@@ -1,0 +1,18 @@
+{
+  "category": "misc",
+  "key": {
+    "a": "minecraft:iron_ingot",
+    "b": "minecraft:redstone",
+    "c": "minecraft:ender_pearl"
+  },
+  "pattern": [
+    "aba",
+    "bcb",
+    "aba"
+  ],
+  "result": {
+    "count": 4,
+    "id": "dimstorage:dim_wall"
+  },
+  "type": "minecraft:crafting_shaped"
+}
