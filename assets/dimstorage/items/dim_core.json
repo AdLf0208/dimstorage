@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "dimstorage:item/dim_core",
+    "type": "minecraft:model"
+  }
+}

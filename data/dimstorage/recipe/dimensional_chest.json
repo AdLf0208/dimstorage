@@ -1,0 +1,17 @@
+{
+  "category": "misc",
+  "key": {
+    "a": "dimstorage:dim_wall",
+    "b": "dimstorage:solid_dim_core"
+  },
+  "pattern": [
+    "aaa",
+    "aba",
+    "aaa"
+  ],
+  "result": {
+    "count": 1,
+    "id": "dimstorage:dimensional_chest"
+  },
+  "type": "minecraft:crafting_shaped"
+}

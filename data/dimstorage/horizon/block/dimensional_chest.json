@@ -1,0 +1,11 @@
+{
+  "template": "minecraft:barrel",
+  "properties": {
+    "hardness": 3.5,
+    "explosion_resistance": 3.5,
+    "requires_tool": true,
+    "map_color": 33,
+    "sounds": "minecraft:iron_block"
+  },
+  "item": true
+}

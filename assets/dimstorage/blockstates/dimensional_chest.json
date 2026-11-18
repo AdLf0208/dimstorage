@@ -1,0 +1,40 @@
+{
+  "variants": {
+    "facing=down,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=down,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=up,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=up,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=north,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=north,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=south,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=south,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=west,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=west,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=east,open=false": {
+      "model": "dimstorage:block/dimensional_chest"
+    },
+    "facing=east,open=true": {
+      "model": "dimstorage:block/dimensional_chest"
+    }
+  }
+}

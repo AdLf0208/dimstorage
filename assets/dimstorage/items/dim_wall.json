@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "dimstorage:item/dim_wall",
+    "type": "minecraft:model"
+  }
+}

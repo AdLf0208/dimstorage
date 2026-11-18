@@ -1,0 +1,10 @@
+{
+  "title": "DimStorage",
+  "icon": "dimstorage:dimensional_chest",
+  "items": [
+    "dimstorage:dimensional_chest",
+    "dimstorage:dim_core",
+    "dimstorage:dim_wall",
+    "dimstorage:solid_dim_core"
+  ]
+}

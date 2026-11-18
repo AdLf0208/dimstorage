@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "dimstorage:item/dimensional_chest",
+    "type": "minecraft:model"
+  }
+}

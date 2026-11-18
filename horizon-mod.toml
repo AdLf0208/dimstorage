@@ -1,0 +1,26 @@
+id = "dimstorage"
+name = "DimStorage"
+version = "0.2.0"
+description = """A port of DimStorage for Horizon: the dimensional chest. Every chest on the same public
+frequency (default public / 1) shows the same 54 slots in any dimension, opened through the vanilla
+9x6 menu, and one world-global store per frequency is persisted in <world>/dimstorage/inventories.dat;
+/dimstorage channel|info|put|take is the headless fallback for the deferred frequency screen. The tank,
+the tablet, the owner/lock/frequency screen, the custom renderer and the remaining cosmetics are not
+ported yet."""
+authors = ["Edivad99", "AdLf0208"]
+# The original's licence: AGPL-3.0-only (Edivad99/DimStorage); its text and the provenance notice
+# travel inside the package as LICENSE / LICENSE-NOTICE.md.
+# A native mod: Rust in src/, compiled by the launcher against the game build [native] pins, beside
+# data/ and assets/. The id is the resource namespace and the only identity.
+api = "0.2"
+# The installation side, not the hook's: the store and the block entity run on the server, and single
+# player's integrated server belongs to the client installation, so "both".
+side = "both"
+# The one shared value every manifest carries ("May add blocks, items, mob effects and entity types"):
+# this package declares the dimensional chest block and its item through the carried content.
+capabilities = ["registries"]
+
+[native]
+game = "26.3"
+horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

@@ -1,0 +1,20 @@
+[package]
+# Port of DimStorage 9.1.1 (Edivad99/DimStorage, AGPL-3.0-only), tag 9.1.1 at
+# 0c7cd55151b73dd7a69fb1b02c6259e980c46c1d, Minecraft Java 1.21.1 NeoForge;
+# the port targets Horizon 26.3 at the pin in horizon-mod.toml. Clean-room Rust
+# rewrite from the mod's behaviour (notes.md); local-only until the maintainer
+# approves publishing, publishable under AGPL-3.0 with this source.
+#
+# Cargo's name and version are not the mod's identity: horizon-mod.toml is.
+name = "dimstorage"
+version = "0.2.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "DimStorage for Horizon: frequency-linked dimensional chests"
+publish = false
+
+[dependencies]
+# The pinned SDK's API crate, fetched into .horizon/sdk/ by any `cargo horizon-mod` command (the
+# launcher builds against its own copy of the same build). Any other registry dependency must be
+# pinned with `horizon-launcher native-lock .` before building.
+horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
