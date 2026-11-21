@@ -1,0 +1,24 @@
+{
+  "type": "minecraft:block",
+  "pools": [
+    {
+      "condition": {
+        "type": "minecraft:survives_explosion"
+      },
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "functions": [
+            {
+              "function": "minecraft:copy_name",
+              "source": "block_entity"
+            }
+          ],
+          "name": "dimstorage:dimensional_tank"
+        }
+      ],
+      "rolls": 1
+    }
+  ],
+  "random_sequence": "dimstorage:blocks/dimensional_tank"
+}

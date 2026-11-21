@@ -1,0 +1,19 @@
+{
+  "category": "misc",
+  "key": {
+    "a": "dimstorage:dim_wall",
+    "b": "dimstorage:solid_dim_core",
+    "c": "minecraft:cauldron",
+    "d": "#c:glass_blocks"
+  },
+  "pattern": [
+    "ada",
+    "dcd",
+    "aba"
+  ],
+  "result": {
+    "count": 1,
+    "id": "dimstorage:dimensional_tank"
+  },
+  "type": "minecraft:crafting_shaped"
+}

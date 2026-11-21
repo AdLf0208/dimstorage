@@ -1,12 +1,13 @@
 id = "dimstorage"
 name = "DimStorage"
-version = "0.2.0"
-description = """A port of DimStorage for Horizon: the dimensional chest. Every chest on the same public
-frequency (default public / 1) shows the same 54 slots in any dimension, opened through the vanilla
-9x6 menu, and one world-global store per frequency is persisted in <world>/dimstorage/inventories.dat;
-/dimstorage channel|info|put|take is the headless fallback for the deferred frequency screen. The tank,
-the tablet, the owner/lock/frequency screen, the custom renderer and the remaining cosmetics are not
-ported yet."""
+version = "0.2.3"
+description = """A port of DimStorage for Horizon: the dimensional chest and the dimensional tank.
+Every chest on the same public frequency (default public / 1) shows the same 54 slots in any
+dimension, opened through the vanilla 9x6 menu, and every tank on a channel holds the same 16,000 mB
+of fluid, filled and drained with buckets; both stores are world-global and persisted in
+<world>/dimstorage/. /dimstorage channel|info|put|take are the headless fallbacks for the deferred
+frequency screen. The tablet, the owner/lock/frequency screen, the custom renderer, the tank's screen
+and comparator and the remaining cosmetics are not ported yet."""
 authors = ["Edivad99", "AdLf0208"]
 # The original's licence: AGPL-3.0-only (Edivad99/DimStorage); its text and the provenance notice
 # travel inside the package as LICENSE / LICENSE-NOTICE.md.
@@ -22,5 +23,5 @@ capabilities = ["registries"]
 
 [native]
 game = "26.3"
-horizon = "0b14f8acfd97fa2c750e42795249dcc981178ca4"
+horizon = "0a875da91dbb0fdcb7ba8c42c11341aa229af51a"
 mixins = "e59da9094f0c2fdda6c627fe9eff22dec6a906f0"

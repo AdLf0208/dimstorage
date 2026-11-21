@@ -1,0 +1,6 @@
+{
+  "model": {
+    "model": "dimstorage:item/dimensional_tank",
+    "type": "minecraft:model"
+  }
+}

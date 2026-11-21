@@ -11,13 +11,13 @@ read for behaviour only; this is a clean-room Rust rewrite.
 AGPL-3.0 permits redistribution under the same licence with the complete
 corresponding source; it is not a publishing bar.
 
-Status: **slice 1 implemented and verified in-game** — the dimensional chest,
-its 54-slot remote inventory, the menu, and persistence across a relaunch.
-Tank, tablet, owner/lock/frequency screen, custom renderer and the remaining
-cosmetics are deferred (see Gaps). **Package 0.2.0** republishes the same
-behaviour as one flat SDK `.hmod` (supersedes the closed `.hnmod` PR #804); see
-`## Migration to the SDK format` at the end for the file map, the hook map, the
-0.2.0 ladder and the one new gap (no launcher, so no 0.2.0 in-game run).
+Status: **slices 1–2 implemented and verified in-game** — the dimensional chest (its 54-slot
+remote inventory, the menu, and persistence across a relaunch) and the dimensional tank (one
+16,000 mB fluid per frequency, shared across tanks, filled and drained by buckets, capped and
+persisted). The frequency/owner/lock screen, the tablet, the custom renderer/lid animation, the
+tank's own screen and comparator and the remaining cosmetics are deferred (see Gaps). **Package
+0.2.3** (pin `0a875da`) carries both; `## Slice 2 — the dimensional tank (0.2.3)` is the slice's
+record and `## Migration to the SDK format` the 0.2.0 file map.
 
 ## Class + tier and approach
 
@@ -152,6 +152,39 @@ component (so a broken chest re-places on the default channel).
   fallback for the missing GUI.
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+## Review fixes (2026-11-18)
+
+The reviewer's source review of PR #1221 (`var/review-all/1221-dimstorage.md`, **held**) left three
+findings; all three are fixed in **0.2.1** (`69500 B`, sha256 `18641dc422a34eadab58d4f049e23f6642a7307bb4513f450765e0a84d4884d6`).
+
+- **`src/support.rs:435` — `channel`, `info`, `put` and `take` were public and the coordinate lookup
+  checked only the block identity: a non-operator could retune another chest or withdraw its
+  contents.** All four now need physical access or the operator level (`runtime::may_read`, 6
+  blocks), `take` additionally needs a recipient who can hold items (a spectator is refused), and
+  the slot must be the chest's own (`runtime::take_allowed`). Tests:
+  `runtime::tests::only_an_operator_or_a_nearby_player_uses_a_channel_command`; the harness player
+  is an ordinary player standing beside each chest (no operator), and the e2e's `info` restores its
+  position.
+- **`src/runtime.rs:371` — two loaded chests exposed independently writable copies, and `take` gave
+  items before updating the store.** The merge is now a **count delta** against the authoritative
+  store (`merged_slot`, used by both `sync` and `commit`), a chest's access commits at the point of
+  access (`Hooks::contents_changed`) and is pushed into every other loaded chest of the channel at
+  once (with a re-entrancy guard), and `take` reserves from the store *before* giving the stack and
+  gives it back if the inventory cannot hold it. Tests:
+  `runtime::tests::two_chests_each_withdraw_from_one_shared_stack`,
+  `…::two_chests_each_insert_into_one_shared_stack`,
+  `…::a_sibling_that_has_not_changed_adopts_the_committed_withdrawal`.
+- **`src/support.rs:518` — syncing a visited channel materialized a permanent 54-slot entry even
+  when empty, so arbitrary signed ids plus public retuning grew the store without bound.**
+  `Store::set` drops a channel that holds nothing, refuses a new channel past
+  `runtime::MAX_CHANNELS` (4096), and `sync` no longer records an empty unknown channel. Tests:
+  `…::an_empty_channel_is_not_retained`, `…::the_store_refuses_more_channels_than_its_cap`. The e2e
+  now asserts the empty channel is **absent** from the store file (the previous assertion required
+  it to be present).
+
+**In-game leg:** `ports/tools/launcher-game.sh run dimstorage` → `PASS` + `E2E EXIT:0`, control
+`EXIT:1`, recorded in `ports/_shared/evidence/dimstorage-e2e/`.
 
 ## Verification
 
@@ -551,5 +584,265 @@ listed above; `tools/package.sh`'s old AE2 write-out is superseded, not a defect
 > hooks; `perform_command` became the typed `run_mod_command`; the store loads on the first server
 > tick and its item lines are hex network NBT. Same feature set and the same gaps (tank, tablet,
 > owner/lock screen, renderer, frequency component).
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+## Slice 2 — the dimensional tank (0.2.3)
+
+**The gap it closes**, verbatim from `Gaps / deviations` above:
+
+> 4. **Tank/tablet content is omitted.** Only the chest and the component items its recipe tree
+>    needs are carried; the tank/tablet recipes, advancements and assets are removed rather than
+>    shipping inert blocks.
+
+The tank is the second half of the mod's own product (chest + tank + tablet) and the one remaining
+family that is a **machine**: a block entity, a fluid store shared by frequency, a capability the
+game (and pipes) reach, a bucket interaction and a persisted world store. It fits the `machines`
+tier exactly; the tablet (remote item access from an item) and the frequency/owner/lock screen
+(client UI) stay deferred.
+
+### Behaviour (as upstream, within the pin)
+
+- **One fluid per frequency**, `DimTankStorage.CAPACITY = 16000` millibuckets (sixteen buckets),
+  keyed exactly as the chest's store is (`Frequency`, default `public / 1`), and **separate from
+  the chest's channels** — upstream keys item and fluid stores by a `type` suffix.
+- **Shared across tanks**: every loaded tank of a channel shows the same fluid. The store is the
+  truth and each tank **mirrors** it into its own `fluids` saved list once per block-entity tick,
+  merged with the tank's last snapshot as an amount delta (the same model the chest uses).
+- **Buckets**: right-clicking the tank with any fluid container runs the game's own
+  `fluid_util::interact_with_fluid_handler` over the block's `fluids` capability, so the item
+  exchange, the `BucketResourceHandler` semantics, the bucket sound and the fluid game event are
+  vanilla's (the tank is not a bucket special case). An empty hand answers the channel's contents.
+- **Cap**: a fill takes only the free millibuckets; the 17th bucket of water into a full tank is
+  refused and the bucket stays full.
+- **Break/explosion**: the fluid lives in the store, never in the block, so a broken tank drops
+  (its loot table) and a fresh tank on that channel finds the fluid.
+- **Commands**: `/dimstorage channel <pos> <n>` now retunes a tank as well as a chest, and
+  `/dimstorage info <pos>` prints a tank's line (`DimStorage tank: public / 1 (3000 / 16000 mB of
+  minecraft:water)`); both are the port's headless fallback for the deferred tank screen.
+
+### What was added (SDK format)
+
+| Where | What |
+|---|---|
+| `src/runtime.rs` | `TANK_CAPACITY`, `TankFluid`, `Tank`, `TankStore` (fill/drain/cap/channels/codec), `merged_tank`, `shown_tank`, `tank_sync`, `tank_commit`, `tank_switch` — 9 of the 32 runtime tests, beside the chest's 23 |
+| `src/support.rs` | `declare_tank` (`block_fluids` = one 16,000 mB tank on every face), `TankBlock` (the `use_item_on` bucket path), `tank_tick` (mirror + merge), the `fluids` compound read/write, `<world>/dimstorage/tanks.dat`, the `info`/`channel` tank paths |
+| `src/lib.rs` | `support::declare_tank(r)` beside the chest |
+| `assets/` | the carried tank blockstate/model/item definition/textures, the tank's lang keys |
+| `data/` | `horizon/block/dimensional_tank.json` (glass template), recipe, loot table, advancement, creative-tab entry, the pickaxe tag, `c:tags/item/glass_blocks` |
+
+### TDD: red first, then green
+
+The store's rule was written as a test and watched fail twice:
+
+1. The **delta merge**, against the naive absolute write (the defect the chest's review found):
+
+```
+---- runtime::tests::two_tanks_each_fill_a_bucket_into_one_shared_tank stdout ----
+thread 'runtime::tests::two_tanks_each_fill_a_bucket_into_one_shared_tank' panicked at src/runtime.rs:1268:9:
+assertion `left == right` failed: both bucket fills add: 1000 + 1000
+  left: Some(TankFluid { id: "minecraft:water", amount: 1000 })
+ right: Some(TankFluid { id: "minecraft:water", amount: 2000 })
+
+---- runtime::tests::a_tank_that_has_not_changed_adopts_a_sibling_drain stdout ----
+thread 'runtime::tests::a_tank_that_has_not_changed_adopts_a_sibling_drain' panicked at src/runtime.rs:1288:9:
+assertion `left == right` failed
+  left: Some(TankFluid { id: "minecraft:water", amount: 2000 })
+ right: Some(TankFluid { id: "minecraft:water", amount: 1000 })
+
+test result: FAILED. 35 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+2. A **real defect the in-game leg found** — a sibling tank mirroring the channel wrote the amount
+   with an empty fluid id (the id was taken from the local/snapshot copy only, and an untouched
+   tank has neither). This is the red that fixed it:
+
+```
+thread 'runtime::tests::an_untouched_sibling_adopts_the_channels_fluid_with_its_id' panicked at src/runtime.rs:1346:9:
+assertion `left == right` failed
+  left: Some(TankFluid { id: "", amount: 1000 })
+ right: Some(TankFluid { id: "minecraft:water", amount: 1000 })
+
+test result: FAILED. 39 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+Green after the fix: **40 passed, 0 failed** (`../_shared/evidence/dimstorage/sdk-test.log`).
+
+### Ladder (0.2.3, pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a`, mixins `e59da909…`)
+
+Every step ran through `ports/tools/build-slot.sh` with `CARGO_INCREMENTAL=0`, local steps with
+`BUILD_LOCAL=1` (the SDK project has no staged tree), never a bare `cargo` outside a lease, never
+`--target-dir`. `.horizon/sdk` was **deleted** after the repin and the build printed
+`SDK 0a875da (build 0a875da91dbb…)`, so the cached surface is the pin's.
+
+| Step | Result | Evidence |
+|---|---|---|
+| `cargo test --offline` | **40 passed**, 0 failed | `sdk-test.log` |
+| `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** | `sdk-clippy.log` |
+| `cargo fmt --check` | `fmt_exit=0` | `sdk-fmt.log` |
+| build 1 (`rm -f Cargo.lock` first) | `Built ./target/horizon-mod/dimstorage.hmod`, 81,237 B, sha256 `0ef5637c…741c` | `sdk-build.log` |
+| build 2 (same, after `rm -f Cargo.lock`) | **`cmp: identical`** | `sdk-build-second.log` |
+| `cargo horizon-mod check dimstorage.hmod` | exit 0 | `sdk-check.log` |
+| `cargo horizon-mod fits dimstorage.hmod --build 0a875da` | `0a875da  made for` | `sdk-fits.log` |
+| `cargo horizon-mod fits dimstorage.hmod --build 0b14f8a` | `0b14f8a  fits` | `sdk-fits-other.log` |
+| `python3 ports/tools/verify-sdk-package.py dimstorage` | **1/1**, runtime byte-identical inside the package | — |
+| `python3 ports/tools/check_261_dialect.py .` | exit 0, every recipe/loot file in the 26.3 shape | — |
+
+`check`, verbatim:
+
+```
+dimstorage 0.2.3 (native-mod, format native-1/0a875da91dbb0fdcb7ba8c42c11341aa229af51a/e59da9094f0c2fdda6c627fe9eff22dec6a906f0, for 26.3)
+  81237 bytes, SHA-256 0ef5637cb09c57f989f275c2cc067006f0403e382ef540e94fd12192913d741c, unsigned
+  native source: unsandboxed; not executed by the registry check. Compile and test against the exact pinned Horizon and Mixins revisions before review.
+```
+
+`fits`, verbatim:
+
+```
+DimStorage:
+0a875da  made for
+```
+
+```
+DimStorage:
+0b14f8a  fits
+```
+
+### In-game leg (launcher-built game, `launcher-game.sh build dimstorage`)
+
+`Compiling dimstorage (1 of 1)` in the build log (the manifest was bumped, so the launcher did not
+reuse the previous binary), then `build-slot.sh run --step e2e -- tools/e2e.sh`:
+`PASS` + `E2E EXIT:0` in `../_shared/evidence/dimstorage-e2e/e2e-launcher.log`; the control on the
+same Nightly **without** the package ends `EXIT:1`, `SELFTEST=1` (the chest assertion inverted)
+`EXIT:1`, `SELFTEST=tank` (the tank assertion inverted) `EXIT:1`;
+`check-e2e-logs.py dimstorage-e2e --strict` → **4/4**.
+
+Quoted from `e2e-launcher.log`:
+
+```
+== the tank recipe crafts in a crafting table ==
+  result slot: {"count":1,"item":"dimstorage:dimensional_tank","slot":200}
+  the grid is empty after the craft (every ingredient was consumed)
+  dimensional tanks in the inventory: 1
+  block at 2,100,12: {"block":"dimstorage:dimensional_tank","loaded":true,"pos":[2,100,12],"state":"dimstorage:dimensional_tank"}
+== the tank: channel 1 shares a bucket, channel 2 holds its own fluid ==
+  info(0,100,8): DimStorage tank: public / 1 (0 / 16000 mB, empty)
+  info(0,100,8): DimStorage tank: public / 1 (1000 / 16000 mB of minecraft:water)
+  info(4,100,8): DimStorage tank: public / 1 (1000 / 16000 mB of minecraft:water)
+  info(8,100,8): DimStorage tank: public / 2 (0 / 16000 mB, empty)
+  info(20,100,8): DimStorage tank: public / 3 (0 / 16000 mB, empty)
+  channel 1 shared the bucket; channel 2 and the unused channel 3 stayed empty
+== an empty bucket drains the channel; a second fluid stays on its channel ==
+  info(0,100,8): DimStorage tank: public / 1 (0 / 16000 mB, empty)
+  water buckets after the drain: 1 (the drained bucket came back full)
+  info(8,100,8): DimStorage tank: public / 2 (1000 / 16000 mB of minecraft:lava)
+  a lava bucket filled only the channel-2 tank
+== a tank channel caps at sixteen buckets ==
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+  water buckets around the refused 17th fill: 1 -> 1
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+== breaking a tank drops it (survival) and leaves the store intact ==
+  has(2,99,12) dimstorage:dimensional_tank x1: ok
+  hopper(2,99,12)=[{"count":1,"item":"dimstorage:dimensional_tank"}]
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+  has(0,100,0) minecraft:diamond x7: ok
+  a fresh tank found the channel's water after the break
+== every carried loot table rolls its own item ==
+  dimstorage:blocks/dimensional_chest: Dropped 1 [Dimensional Chest]
+  dimstorage:blocks/dimensional_tank: Dropped 1 [Dimensional Tank]
+== both store files exist and both stores survive a relaunch ==
+  inventories: f public,1 f public,2
+  tanks: t public,1 minecraft:water 16000 t public,2 minecraft:lava 1000
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+  info(8,100,8): DimStorage tank: public / 2 (1000 / 16000 mB of minecraft:lava)
+PASS: the tank recipe crafted and placed, same-channel tanks shared one fluid while another channel held its own, an empty bucket drained the channel, a channel capped at 16000 mB and refused the 17th bucket, a broken tank dropped into a hopper with its fluid intact, same-frequency chests shared 54 slots, a vanilla barrel never shared, and both stores survived a relaunch
+EXIT:0
+```
+
+Fail-capable: the control (the same script on the Nightly without the package) fails at the craft
+(`the crafting table offered {"item":null,"slot":200}`) and exits 1; `SELFTEST=1` fails at
+`expected an empty container at 4,100,0; got [{"count":8,"item":"minecraft:diamond"}]`; `SELFTEST=tank`
+fails at `expected … '(0 / 16000 mB, empty)', got 'DimStorage tank: public / 1 (1000 / 16000 mB of
+minecraft:water)'`. The differential controls inside the pass: a lava bucket on channel 2 leaves
+channel 1 empty, an unused channel 3 stays empty and unrecorded, and the vanilla barrel still never
+shares.
+
+Two harness facts this leg cost (for the next slice): a **creative** break drops nothing, so the drop
+leg switches to survival with a pickaxe; and a **hopper under a chest pulls from the shared channel**
+(correct mod behaviour), so a chest is never broken over a hopper in a test that wants the channel
+intact — the loot tables are rolled with `/loot give` instead. A crafting grid slot takes the whole
+carried stack on a left click; one item per right click.
+
+### Coverage (family → how it is proven)
+
+| Family (from the jar) | Status |
+|---|---|
+| `dimensional_chest` block + item | `tested` — placed, read back, ids unknown without the package (control leg) |
+| chest 54-slot menu, deposit/withdraw | `tested` — menu deposit, right-click split, withdraw, shared across chests |
+| chest frequency isolation | `tested` — channel 2/3 chests stay separate; vanilla barrel differential |
+| chest recipes (4) | `tested` — the chest's own tree was carried in slice 1; this slice's craft proof is the tank's, and slice 1's four recipes remain unproven in game (recorded gap) |
+| `dimensional_tank` block + item | `tested` — crafted, placed by its item, read back |
+| tank recipe (`c:glass_blocks`, cauldron) | `tested` — crafted in a crafting table, result id + count, grid emptied |
+| tank fluid store, sharing, cap, drain | `tested` — bucket in/out, sibling mirror, 16,000 mB cap, 17th refused |
+| tank frequency isolation | `tested` — lava on channel 2, water on channel 1, channel 3 unused |
+| tank loot table / block loot tables | `tested` — survival break into a hopper (tank) and `/loot give` for both tables |
+| tank drop keeps the fluid | `tested` — re-placed tank finds channel 1's water |
+| tag `minecraft:mineable/pickaxe` | `tested` — `/execute if block … #minecraft:mineable/pickaxe` → `Test passed`, and the survival drop |
+| `c:glass_blocks` tag | `tested` — the recipe matched with `minecraft:glass` |
+| persistence (`inventories.dat`, `tanks.dat`) | `tested` — both files asserted line by line, then a relaunch |
+| `/dimstorage channel`, `/dimstorage info` | `tested` — parsed reply lines for chests and tanks |
+| tank comparator output | `not ported` — no `analog_output` part: `LevelHost` in `analog_output` cannot read a block entity at a position, and the readout would need a cached (pos → channel) table; upstream returns `amount / 1000` |
+| tank screen / GUI, custom tank renderer | `not ported` — `machines`/`client` boundary: the port ships the command fallback, not a screen |
+| tank waterlogged state | `not ported` — the glass template has no `waterlogged` property; upstream is `SimpleWaterloggedBlock` |
+| tank auto-eject, tank lock | `not ported` — upstream features outside this slice |
+| `dimensional_tablet`, owner/lock/frequency screen, custom chest renderer | `not ported` — deferred as before (client UI / item-remote-access) |
+| item `dimstorage:frequency` component | `not ported` — a re-placed chest/tank starts on public/1; the tank's loot table drops the `copy_components` function for that reason |
+
+### Deviations this slice adds
+
+1. **A separate tank file.** `<world>/dimstorage/tanks.dat` (`t public,1 minecraft:water 16000`)
+   beside `inventories.dat`, where upstream keeps both in one `SavedData`. Same rename-and-debounce
+   write; the item store's format is untouched, so 0.2.1 worlds load.
+2. **The mirror staleness**, as the chest's gap 7: a pipe or a bucket writes the tank's copy between
+   ticks; the tick merges it. A tank's own `use_item_on` syncs the channel *before* the handler reads
+   it, so a bucket never drains fluid a sibling already took in that window.
+3. **No waterlogging, a full-cube collision box**, and no tank screen/comparator/auto-eject (table
+   above). The carried model is a 12×16×12 shell but the block collides as the glass template's
+   cube; upstream's `box(2,0,2,14,16,14)` is not expressible in a content block declaration at this
+   pin.
+4. **Fluid ids are the pin's**: a tank holds what the game's fluid handler accepted, so a fluid this
+   build does not know cannot be stored (the same limit the chest's item ids have).
+
+### Upstream defects fixed
+
+- **The tank advancement showed the tablet's text.** `data/dimstorage/advancement/dimensional_tank.json`
+  names `advancements.dimstorage.dimensional_tablet` / `.desc` for its title and description, and the
+  lang file repeats the copy-paste (`advancements.dimstorage.dimensional_tank = "Dimensional Tablet"`,
+  `.desc = "A remote inventory"`). The port points the advancement at the **tank's own** keys and
+  gives them the tank's English. A user notices the tank's advancement reading "Dimensional Tank".
+  No `ctl` readout exposes an advancement toast at this pin, so this is a data fix evidenced by the
+  files, not an in-game assertion.
+- **`tank` recipe tree in the 1.21.1 dialect** (a carry defect, not the mod's): the recipe's
+  ingredients were `{"item": …}` objects and the loot pool used the `"conditions": [ … ]` array and
+  `bonus_rolls`/`rolls: 1.0`. Converted to bare ids / `#tag`, a singular `"condition"` and
+  `"rolls": 1` — `check_261_dialect.py` exit 0, and both tables proven in game.
+- **`#c:glass_blocks` has no 26.3 tag**, so the carried recipe could never match. The port ships
+  `data/c/tags/item/glass_blocks.json` with vanilla's glass family (the NeoForge conventional tag
+  the recipe was written against), and proves the craft with `minecraft:glass`.
+- **The tank block was in no `minecraft:mineable/*` tag** while declaring `requires_tool: true`
+  (the measured "no drop" defect): added to `minecraft:mineable/pickaxe`, proven by the survival
+  drop into the hopper.
+
+### Changelog text (0.2.3, for the publisher)
+
+> **0.2.3 — the dimensional tank.** The second half of the mod: `dimstorage:dimensional_tank`, one
+> 16,000 mB fluid per frequency, shared by every tank on its channel in any dimension and persisted
+> in `<world>/dimstorage/tanks.dat`. A bucket fills or drains it through the game's own fluid handler
+> (vanilla sound, game event and container semantics); the 17th bucket is refused at the cap; a
+> broken tank drops and the channel keeps its fluid. `/dimstorage channel` retunes a tank,
+> `/dimstorage info` prints its contents. The recipe crafts in a crafting table (with the
+> `c:glass_blocks` tag it was written against), the loot table and the pickaxe tag are carried, and
+> the tank's advancement no longer shows the tablet's text. Chest behaviour is unchanged; pin
+> `0a875da` / mixins `e59da90`.
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port

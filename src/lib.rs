@@ -44,8 +44,10 @@ struct Mod;
 impl Hooks for Mod {
     /// Declare what the game answers for the chest (`EntityBlock` plus the container capability): a
     /// block entity type with its Part, its first saved compound, and the 54-slot 9x6 container.
+    /// The tank declares its block entity and its 16000 mB fluid capability beside it.
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         support::declare(r);
+        support::declare_tank(r);
     }
 
     /// `/dimstorage channel|info|put|take`.

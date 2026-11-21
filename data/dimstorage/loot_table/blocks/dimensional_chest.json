@@ -2,7 +2,6 @@
   "type": "minecraft:block",
   "pools": [
     {
-      "bonus_rolls": 0.0,
       "condition": {
         "type": "minecraft:survives_explosion"
       },
@@ -12,7 +11,7 @@
           "name": "dimstorage:dimensional_chest"
         }
       ],
-      "rolls": 1.0
+      "rolls": 1
     }
   ],
   "random_sequence": "dimstorage:blocks/dimensional_chest"
