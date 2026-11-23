@@ -1,11 +1,11 @@
-# Package receipt — dimstorage 0.2.3
+# Package receipt — dimstorage 0.2.4
 
 | field | value |
 |---|---|
-| version | `0.2.3` |
+| version | `0.2.4` |
 | file | `dimstorage.hmod` |
-| bytes | 81,237 |
-| sha256 | `0ef5637cb09c57f989f275c2cc067006f0403e382ef540e94fd12192913d741c` |
+| bytes | 86,836 |
+| sha256 | `02cc3b1c937686ba6a4e8f1929ca470f6d91fe5cecdc597fbd20c58a5b6333ed` |
 | source | this tag — the tree here is the source that produced the archive |
 | game | 26.3 |
 | horizon | `0a875da91dbb0fdcb7ba8c42c11341aa229af51a` |

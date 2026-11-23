@@ -17,7 +17,7 @@
 // Slice 1 is the dimensional chest. The tank, tablet, owner/lock screen,
 // upgrades and the custom renderer are deferred; see ../notes.md.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// A dimensional chest's slots: six rows of nine, as upstream's
 /// `DimChestStorage.getContainerSize()`.
@@ -599,6 +599,10 @@ pub type Tank = Option<TankFluid>;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct TankStore {
     tanks: BTreeMap<Frequency, TankFluid>,
+    /// Channels this world has known, including ones that now hold nothing. A
+    /// drained channel drops its fluid entry, but the marker must survive a save:
+    /// otherwise a tank's stale saved copy re-seeds the channel it no longer owns.
+    known: BTreeSet<Frequency>,
 }
 
 impl TankStore {
@@ -611,40 +615,77 @@ impl TankStore {
         self.tanks.contains_key(frequency)
     }
 
+    /// Whether this world has ever known this channel, even if it holds nothing
+    /// now. A channel that is not known may be bootstrapped from a tank; a known
+    /// empty one may not.
+    pub fn knows(&self, frequency: &Frequency) -> bool {
+        self.known.contains(frequency)
+    }
+
+    /// Remember a channel, empty or not; whether the marker was new. Bounded by
+    /// [`MAX_CHANNELS`], as a new channel with fluid is.
+    pub fn know(&mut self, frequency: &Frequency) -> bool {
+        if self.known.contains(frequency) {
+            return false;
+        }
+        if self.known.len() >= MAX_CHANNELS {
+            return false;
+        }
+        self.known.insert(frequency.clone())
+    }
+
     /// The frequency's tank, `None` when it is empty or unknown.
     pub fn get(&self, frequency: &Frequency) -> Tank {
         self.tanks.get(frequency).cloned()
     }
 
-    /// Store a channel's tank; an empty one is not retained, as the chest
-    /// store's empty channel is not, and a new channel past [`MAX_CHANNELS`]
-    /// is refused.
+    /// Store a channel's tank; an empty one keeps only its known marker, as the
+    /// chest store's empty channel is not retained, and a new channel past
+    /// [`MAX_CHANNELS`] is refused. Whether the saved file would change.
     pub fn set(&mut self, frequency: &Frequency, tank: Tank) -> bool {
         let tank = tank.and_then(|fluid| fluid.clamped());
         let Some(tank) = tank else {
-            self.tanks.remove(frequency);
-            return false;
+            let removed = self.tanks.remove(frequency).is_some();
+            let known = self.know(frequency);
+            return removed || known;
         };
-        if !self.tanks.contains_key(frequency) && self.tanks.len() >= MAX_CHANNELS {
-            return false;
+        if !self.known.contains(frequency) {
+            if self.known.len() >= MAX_CHANNELS {
+                return false;
+            }
+            self.known.insert(frequency.clone());
         }
+        let changed = self.tanks.get(frequency) != Some(&tank);
         self.tanks.insert(frequency.clone(), tank);
-        true
+        changed
     }
 
+    /// How many channels this world knows (with fluid or emptied).
     pub fn channels(&self) -> usize {
-        self.tanks.len()
+        self.known.len()
+    }
+
+    /// Free millibuckets for `id`: the whole capacity on an empty channel, the
+    /// capacity minus what it holds when it holds that fluid, and none for
+    /// another fluid.
+    pub fn room(&self, frequency: &Frequency, id: &str) -> i32 {
+        match self.tanks.get(frequency) {
+            Some(held) if held.id != id => 0,
+            Some(held) => TANK_CAPACITY.saturating_sub(held.amount),
+            None => TANK_CAPACITY,
+        }
+    }
+
+    /// Whether the channel holds at least `amount` of `id`.
+    pub fn holds(&self, frequency: &Frequency, id: &str, amount: i32) -> bool {
+        self.tanks
+            .get(frequency)
+            .is_some_and(|held| held.id == id && held.amount >= amount)
     }
 
     /// Put `amount` of `id` into a channel; answers how much it took.
     pub fn fill(&mut self, frequency: &Frequency, id: &str, amount: i32) -> i32 {
-        let free = {
-            let held = self.tanks.get(frequency);
-            if held.is_some_and(|held| held.id != id) {
-                return 0;
-            }
-            TANK_CAPACITY - held.map_or(0, |held| held.amount)
-        };
+        let free = self.room(frequency, id);
         let taken = amount.min(free);
         if taken <= 0 {
             return 0;
@@ -652,6 +693,16 @@ impl TankStore {
         let held = self.tanks.get(frequency).map_or(0, |held| held.amount);
         self.set(frequency, Some(TankFluid::new(id, held + taken)));
         taken
+    }
+
+    /// Take `amount` of `id` into a channel only when all of it fits: a fill that
+    /// does not fit is refused whole, so a container never gives fluid the
+    /// channel cannot take. Answers whether it accepted the whole amount.
+    pub fn transfer_in(&mut self, frequency: &Frequency, id: &str, amount: i32) -> bool {
+        if amount <= 0 || self.room(frequency, id) < amount {
+            return false;
+        }
+        self.fill(frequency, id, amount) == amount
     }
 
     /// Take up to `amount` of `id` out of a channel; answers what left.
@@ -668,17 +719,21 @@ impl TankStore {
         Some(TankFluid::new(id, taken))
     }
 
-    /// The tank file's text: a header, then one `t <frequency> <fluid> <amount>`
-    /// line per channel.
+    /// The tank file's text: a header, one `t <frequency> <fluid> <amount>` line
+    /// per channel with fluid, and one `e <frequency>` line for a known channel
+    /// that holds nothing.
     pub fn encode(&self) -> String {
-        let mut out = String::from("# dimstorage-tanks 1\n");
-        for (frequency, tank) in &self.tanks {
-            out.push_str(&format!(
-                "t {} {} {}\n",
-                frequency.text(),
-                tank.id,
-                tank.amount
-            ));
+        let mut out = String::from("# dimstorage-tanks 2\n");
+        for frequency in &self.known {
+            match self.tanks.get(frequency) {
+                Some(tank) => out.push_str(&format!(
+                    "t {} {} {}\n",
+                    frequency.text(),
+                    tank.id,
+                    tank.amount
+                )),
+                None => out.push_str(&format!("e {}\n", frequency.text())),
+            }
         }
         out
     }
@@ -690,6 +745,19 @@ impl TankStore {
         for (number, raw) in text.lines().enumerate() {
             let line = raw.trim_end_matches('\r').trim();
             if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(rest) = line.strip_prefix("e ") {
+                let mut parts = rest.split_whitespace();
+                let (Some(frequency), None) = (parts.next(), parts.next()) else {
+                    warnings.push(format!("line {}: bad tank line {line:?}", number + 1));
+                    continue;
+                };
+                if let Some(frequency) = Frequency::parse(frequency) {
+                    store.know(&frequency);
+                } else {
+                    warnings.push(format!("line {}: bad tank line {line:?}", number + 1));
+                }
                 continue;
             }
             let Some(rest) = line.strip_prefix("t ") else {
@@ -785,17 +853,21 @@ pub fn tank_sync(
     frequency: &Frequency,
 ) -> TankSynced {
     let Some(snapshot) = snapshot else {
-        let known = store.contains(frequency);
-        if !known && local.is_some() {
-            store.set(frequency, local.clone());
+        // A tank with no synced marker (a fresh block, or one saved by 0.2.3): a
+        // channel the world has never known may be seeded from the tank's own
+        // compound, which recovers a lost store file. A channel it has known —
+        // possibly drained to nothing — may not: the tank's copy is stale data,
+        // not the channel's balance.
+        if !store.knows(frequency) && local.is_some() {
+            let store_changed = store.set(frequency, local.clone());
             return TankSynced {
                 tank: local.clone(),
-                store_changed: true,
+                store_changed,
                 how: Tick::Bootstrapped,
             };
         }
         let stored = store.get(frequency);
-        let store_changed = !known && store.set(frequency, stored.clone());
+        let store_changed = store.set(frequency, stored.clone()) | store.know(frequency);
         return TankSynced {
             tank: stored,
             store_changed,
@@ -857,6 +929,31 @@ pub fn tank_switch(
     }
     let changed = tank_commit(local, snapshot, store, from);
     (store.get(to), changed)
+}
+
+/// One tank's capability transfer: `before` is what its own copy held when the
+/// access began, `after` what the game's fluid handler left there. The transfer
+/// commits to the channel's one authoritative balance before the caller reports
+/// success, and `tank` is what the tank must show afterwards.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TankTransfer {
+    pub tank: Tank,
+    pub committed: bool,
+}
+
+/// Commit a capability transfer to the channel before it is reported as done.
+pub fn tank_transfer(
+    before: &Tank,
+    after: &Tank,
+    store: &mut TankStore,
+    frequency: &Frequency,
+) -> TankTransfer {
+    let known = store.know(frequency);
+    let changed = tank_commit(after, Some(before), store, frequency);
+    TankTransfer {
+        tank: store.get(frequency),
+        committed: changed | known,
+    }
 }
 
 /// `items` padded or cut to `SLOTS`.
@@ -1453,5 +1550,92 @@ mod tests {
         assert!(changed);
         assert_eq!(store.get(&old), lava(2000));
         assert_eq!(tank, lava(500));
+    }
+
+    // -- the reviewer's four tank-transfer cases (0.2.4) --------------------
+
+    #[test]
+    fn a_transfer_through_one_tank_is_in_the_channel_before_its_sibling_reads_it() {
+        // Two tanks of one channel both mirror 16,000. The first drains a bucket
+        // through its own copy; its sibling is read before either tank's next
+        // tick. The bucket that came out is real, so the channel must already
+        // hold 15,000; a channel that still says 16,000 serves the same fluid
+        // twice.
+        let mut store = TankStore::new();
+        store.fill(&Frequency::DEFAULT, "minecraft:water", TANK_CAPACITY);
+        let transfer = tank_transfer(
+            &water(TANK_CAPACITY),
+            &water(TANK_CAPACITY - 1000),
+            &mut store,
+            &Frequency::DEFAULT,
+        );
+        assert!(transfer.committed, "the access commits before it answers");
+        assert_eq!(transfer.tank, water(TANK_CAPACITY - 1000));
+        assert_eq!(
+            store.get(&Frequency::DEFAULT),
+            water(TANK_CAPACITY - 1000),
+            "the drained bucket is out of the channel, not only out of one tank"
+        );
+        let sibling = tank_sync(
+            &water(TANK_CAPACITY),
+            Some(&water(TANK_CAPACITY)),
+            &mut store,
+            &Frequency::DEFAULT,
+        );
+        assert_eq!(
+            sibling.tank,
+            water(TANK_CAPACITY - 1000),
+            "the sibling shows the channel, never its own stale copy"
+        );
+    }
+
+    #[test]
+    fn a_transfer_into_a_tank_removed_before_its_next_tick_is_not_lost() {
+        // A tank empties a bucket into the channel and the block is broken (or
+        // its chunk saved and unloaded) before its next tick. The transfer is
+        // finished, so the channel must keep the 1,000 even though no tick runs.
+        let mut store = TankStore::new();
+        let transfer = tank_transfer(&None, &water(1000), &mut store, &Frequency::DEFAULT);
+        assert!(
+            transfer.committed,
+            "a finished transfer is committed at once"
+        );
+        assert_eq!(transfer.tank, water(1000));
+        assert_eq!(store.get(&Frequency::DEFAULT), water(1000));
+    }
+
+    #[test]
+    fn a_restart_does_not_restore_a_drained_channel_from_a_stale_tank() {
+        // The channel held 1,000 and was drained to nothing, so its fluid entry is
+        // dropped; only the fact that the channel is known survives in the file.
+        let mut store = TankStore::new();
+        store.fill(&Frequency::DEFAULT, "minecraft:water", 1000);
+        assert_eq!(
+            store.drain(&Frequency::DEFAULT, "minecraft:water", 1000),
+            water(1000)
+        );
+        let (mut restarted, warnings) = TankStore::decode(&store.encode());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // A tank saved before the drain still carries water 1,000 in its own
+        // compound; on the first tick after the restart it must not re-seed the
+        // channel it no longer owns.
+        let synced = tank_sync(&water(1000), None, &mut restarted, &Frequency::DEFAULT);
+        assert_eq!(
+            synced.tank, None,
+            "a drained channel is not re-seeded by a stale tank"
+        );
+        assert_eq!(restarted.get(&Frequency::DEFAULT), None);
+    }
+
+    #[test]
+    fn a_fill_that_does_not_fit_is_refused_before_any_of_it_lands() {
+        // 15,500 mB held; a 1,000 mB bucket does not fit. The channel must refuse
+        // the whole transfer rather than take the 500 free, so the container is
+        // left full and both sides keep exactly what they had.
+        let mut store = TankStore::new();
+        store.fill(&Frequency::DEFAULT, "minecraft:water", 15_500);
+        let accepted = store.transfer_in(&Frequency::DEFAULT, "minecraft:water", 1000);
+        assert!(!accepted, "a fill that does not fit is refused whole");
+        assert_eq!(store.get(&Frequency::DEFAULT), water(15_500));
     }
 }

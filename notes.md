@@ -11,13 +11,16 @@ read for behaviour only; this is a clean-room Rust rewrite.
 AGPL-3.0 permits redistribution under the same licence with the complete
 corresponding source; it is not a publishing bar.
 
-Status: **slices 1–2 implemented and verified in-game** — the dimensional chest (its 54-slot
-remote inventory, the menu, and persistence across a relaunch) and the dimensional tank (one
+Status: **slices 1–3 implemented and verified in-game** — the dimensional chest (its 54-slot
+remote inventory, the menu, and persistence across a relaunch), the dimensional tank (one
 16,000 mB fluid per frequency, shared across tanks, filled and drained by buckets, capped and
-persisted). The frequency/owner/lock screen, the tablet, the custom renderer/lid animation, the
-tank's own screen and comparator and the remaining cosmetics are deferred (see Gaps). **Package
-0.2.3** (pin `0a875da`) carries both; `## Slice 2 — the dimensional tank (0.2.3)` is the slice's
-record and `## Migration to the SDK format` the 0.2.0 file map.
+persisted), and the reviewer's tank-transfer fix (one authoritative channel balance, committed
+before success; a drained channel protected from stale block data; all-or-nothing fills). The
+frequency/owner/lock screen, the tablet, the custom renderer/lid animation, the tank's own screen
+and comparator and the remaining cosmetics are deferred (see Gaps). **Package 0.2.4** (pin
+`0a875da`) carries all three; `## Slice 3 — the tank-transfer fix (0.2.4)` is the newest record,
+`## Slice 2 — the dimensional tank (0.2.3)` the tank, and `## Migration to the SDK format` the
+0.2.0 file map.
 
 ## Class + tier and approach
 
@@ -846,3 +849,172 @@ carried stack on a left click; one item per right click.
 > `0a875da` / mixins `e59da90`.
 
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-port
+
+## Slice 3 — the tank-transfer fix (0.2.4)
+
+**The review this closes.** `NikitaMGrimm` reviewed the staged 0.2.3 archive/source at `91a7f390`
+and accepted three defects (all three are fixed here; the orchestrator's brief carries the text):
+
+1. **One authoritative channel balance.** Bucket and capability transfers acted on separate
+   per-tank mirrors, so fluid could be lost or duplicated, and removing a tank before its next sync
+   could lose a completed transfer. The transfer must commit against a single authoritative balance
+   for the channel **before** it reports success.
+2. **Stale block data must not restore a drained channel after a restart**, and a capacity
+   rejection must propagate **before** the transfer is accepted (not after part of it landed).
+3. **Regression tests** for sibling transfers (two tanks in one channel), removal of a tank before
+   the next tick, restart after draining, and capacity rejection; written red first.
+
+This is a behaviour fix on the `machines` tier's existing tank capability — no new family, no
+renderer, no client half.
+
+### What changed
+
+- **Commit at the point of access (`src/support.rs`).** `tank_use` still lets the game's fluid
+  handler move the bucket over the block's `fluids` capability, but it now records the tank's
+  contents *before*, and after a successful handler call commits the delta to the channel through
+  `runtime::tank_transfer` and writes the channel's value back into the tank's own compound — all
+  before returning `Success`. A completed transfer therefore no longer waits for a block-entity
+  tick, and a tank removed after it cannot take the transfer with it.
+- **A persisted `synced` marker** (`{Fluid, Amount}` beside `fluids` in the tank's saved compound).
+  It is what the channel held when this tank last synced; the delta against it is a foreign
+  capability transfer (a pipe, or a crash between the handler and the tick). It replaces the
+  in-memory per-uid snapshot, which a restart lost.
+- **Known-channel markers (`TankStore`).** A drained channel drops its fluid entry but keeps
+  `e <frequency>` in `tanks.dat`; a tank with contents and **no** `synced` marker may seed only a
+  channel the world has never known (a lost store file). A known, emptied channel is never re-seeded
+  by a stale saved tank — the restart the review names. The marker set is bounded by the same
+  `MAX_CHANNELS` as fluid entries.
+- **All-or-nothing fills (`TankStore::transfer_in`).** A fill that does not fit is refused whole,
+  and `tank_move` checks the held container against the channel's free room (and an empty
+  container against the channel's fluid) **before** the handler runs, so a capacity refusal leaves
+  both sides untouched. The click is consumed with a message so the held bucket never tries the
+  world.
+- **Break/explosion commit for tanks.** `Hooks::break_block` and `explosion_detonate` now commit a
+  tank's delta to its channel before the block (and its compound) is removed — the tank path joins
+  the chest path.
+- `tanks.dat` is version `2` (the `e` lines); 0.2.2/0.2.3 files decode unchanged. A tank saved by
+  0.2.3 has no `synced` marker and is treated as before (adopt the known channel, or bootstrap an
+  unknown one), so upgrading does not lose or duplicate fluid.
+
+### TDD: the four red tests, verbatim
+
+Added to `src/runtime.rs` before the glue; the first implementation of `tank_transfer`/`transfer_in`
+kept today's model (the transfer stays in one tank's copy; a fill takes what fits), and all four
+failed for their stated reason. Quoted from `../_shared/evidence/dimstorage/sdk-test-transfer-red.log`:
+
+```
+---- runtime::tests::a_fill_that_does_not_fit_is_refused_before_any_of_it_lands stdout ----
+thread '...a_fill_that_does_not_fit_is_refused_before_any_of_it_lands' panicked:
+a fill that does not fit is refused whole
+
+---- runtime::tests::a_restart_does_not_restore_a_drained_channel_from_a_stale_tank stdout ----
+assertion `left == right` failed: a drained channel is not re-seeded by a stale tank
+  left: Some(TankFluid { id: "minecraft:water", amount: 1000 })
+ right: None
+
+---- runtime::tests::a_transfer_into_a_tank_removed_before_its_next_tick_is_not_lost stdout ----
+a finished transfer is committed at once
+
+---- runtime::tests::a_transfer_through_one_tank_is_in_the_channel_before_its_sibling_reads_it stdout ----
+the access commits before it answers
+
+test result: FAILED. 40 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The test bodies are the contract: a drain through tank A is in the channel before sibling B reads
+it; a fill into a tank removed before its tick is not lost; a save/load of a drained channel plus a
+stale tank stays empty; 15,500 mB + a 1,000 mB bucket is refused whole.
+
+### Ladder (0.2.4, pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a`, mixins `e59da909…`)
+
+Every step ran through `ports/tools/build-slot.sh` with `CARGO_INCREMENTAL=0`; the SDK project has
+no staged tree, so local steps used `BUILD_LOCAL=1`. The build printed `SDK 0a875da (build
+0a875da91dbb…)`.
+
+| Step | Result | Evidence |
+|---|---|---|
+| `cargo test --offline` | **45 passed**, 0 failed (41 `runtime::`, 4 `support::`) | `sdk-test.log` |
+| `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** | `sdk-clippy.log` |
+| `cargo fmt --check` | `fmt_exit=0` | `sdk-fmt.log` |
+| build 1 (`rm -f Cargo.lock` first) | 86,836 B, sha256 `02cc3b1c…33ed` | `sdk-build.log` |
+| build 2 (same) | **`cmp: identical`** | `sdk-build-second.log` |
+| `cargo horizon-mod check dimstorage.hmod` | exit 0, `dimstorage 0.2.4 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)` | `sdk-check.log` |
+| `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for` | `sdk-fits.log` |
+| `cargo horizon-mod fits … --build 0b14f8a` | `0b14f8a  fits` | `sdk-fits-other.log` |
+| `python3 ports/tools/verify-sdk-package.py dimstorage` | **1/1** (package sha, runtime byte-identical, no `Cargo.lock`, tests, clippy, check, fits, skills) | `sdk-verify-0.2.4.log` |
+
+Artifact: **86,836 B**, SHA-256 `02cc3b1c937686ba6a4e8f1929ca470f6d91fe5cecdc597fbd20c58a5b6333ed`, **64
+entries** (same layout as 0.2.3: 5 root documents, 3 `src/`, 31 `assets/dimstorage/`, 1 `data/c/`,
+21 `data/dimstorage/`, 2 `data/minecraft/`, `uses.json`), **no `Cargo.lock`**.
+
+### In-game leg (launcher-built game, `launcher-game.sh build dimstorage`)
+
+`Compiling dimstorage (1 of 1)` in `../_shared/evidence/dimstorage-e2e/launcher-build-0.2.4.log`
+(the manifest was bumped), then
+`build-slot.sh run --job W1-dimstorage --port ports/dimstorage --step e2e -- bash tools/e2e.sh`.
+The scenario now reads the block's **own saved compound** with `/data get block … fluids` as well
+as the store/capability readout, and it freezes the clock with `/tick freeze` so the sibling tank is
+genuinely removed before its next tick:
+
+```
+== a tank channel caps at sixteen buckets ==
+  block compound before the 17th fill: 0,100,8hasthefollowingblockdata:[{Amount:16000,Fluid:"minecraft:water"}]
+  water buckets around the refused 17th fill: 1 -> 1
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+== a drain is committed at access; a stale sibling cannot restore it ==
+  water buckets after the frozen drain: 1
+  block compound before the relaunch: 0,100,8hasthefollowingblockdata:[{Amount:15000,Fluid:"minecraft:water"}]
+  info(0,100,8): DimStorage tank: public / 1 (15000 / 16000 mB of minecraft:water)
+  block compound after the relaunch: 0,100,8hasthefollowingblockdata:[{Amount:15000,Fluid:"minecraft:water"}]
+  the channel stayed at 15000 mB after removing the stale sibling and relaunching
+```
+
+The main leg ends `PASS` + `EXIT:0` (`e2e-launcher.log`). The control (the same script on the
+Nightly **without** the package) fails at the craft and exits 1 (`e2e-launcher-control.log`);
+`SELFTEST=1` exits 1 at the chest sharing assertion (`e2e-launcher-selftest.log`), `SELFTEST=tank`
+at the sibling tank (`-selftest-tank.log`), `SELFTEST=capacity` at the refused 17th bucket
+(`-selftest-capacity.log`), and `SELFTEST=transfer` at the drained channel's compound
+(`-selftest-transfer.log`). `check-e2e-logs.py dimstorage-e2e --strict` → **6/6**.
+
+The freeze is what makes the second assertion fail-capable: without it, the sibling ticks within
+50 ms of the drain and its compound is no longer stale. The store file after the run carries
+`t public,1 minecraft:water 15000` (no resurrection) and the drained bucket is in the inventory.
+
+### Coverage (families this slice touches)
+
+| Family | Status |
+|---|---|
+| tank bucket fill/drain through the capability | `tested` — 16 fills to the cap, a refused 17th (bucket and compound unchanged), a drain through one tank read from the block's own compound and the store |
+| tank transfer atomicity (sibling, removal, restart, capacity) | `tested` — the four runtime tests above; in game the frozen-clock drain + removed sibling + relaunch |
+| sibling sharing / channel isolation | `tested` — unchanged from slice 2 (two tanks, lava channel 2, unused channel 3) |
+| tank break/explosion commit | `tested` — survival break into a hopper keeps channel 1 at 15,000 mB and the fresh tank finds it; the explosion path shares `commit_tank` with the chest's |
+| tank recipe, loot tables, pickaxe tag, `c:glass_blocks`, persistence, commands | `tested` — unchanged, still green in the same run |
+| tank comparator, screen, waterlogging, auto-eject, lock | `not ported` — unchanged from slice 2 |
+
+### Deviations / notes this slice adds
+
+1. **`tanks.dat` gains `e <frequency>` lines** for known channels that hold nothing (bounded by
+   `MAX_CHANNELS`). 0.2.2/0.2.3 files load unchanged; a downlevel binary would skip the `e` lines
+   and could resurrect a drained channel, so this is forward-only.
+2. **The tank's compound carries `synced`** beside `fluids` (the last channel value this tank saw).
+   A 0.2.3 tank without it is upgraded in place on its first tick/access.
+3. **`/setblock` removal bypasses the break hook** (as it does for the chest): a pending pipe
+   transfer in a tank deleted that way is lost. A player break and an explosion commit first.
+4. **A refused fill now answers a message** ("The channel has no room for that much fluid." / "The
+   channel does not hold enough fluid for that.") and consumes the click; upstream silently
+   returned a partial fill. This is the pre-move refusal the review asked for.
+5. The pre-check reads the held container's own fluid handler (`ITEM_FLUIDS`), so it works for any
+   container the game registers, not just vanilla buckets.
+
+### Changelog text (0.2.4)
+
+> **0.2.4 — the tank transfer is one authoritative channel balance.** A bucket or any capability
+> transfer now commits to the channel before it reports success, so a sibling can never serve the
+> same fluid twice and a tank removed before its next tick cannot lose a completed transfer. A
+> drained channel is protected by a persisted known-channel marker and each tank's `synced` delta:
+> a stale saved compound cannot restore it after a restart. A fill that does not fit the channel is
+> refused whole, before anything moves. Four regression tests cover sibling transfers, removal
+> before the tick, restart after draining and capacity rejection. Chest behaviour is unchanged;
+> pin `0a875da` / mixins `e59da90`.
+
+Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review

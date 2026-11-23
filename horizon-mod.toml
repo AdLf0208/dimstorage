@@ -1,6 +1,6 @@
 id = "dimstorage"
 name = "DimStorage"
-version = "0.2.3"
+version = "0.2.4"
 description = """A port of DimStorage for Horizon: the dimensional chest and the dimensional tank.
 Every chest on the same public frequency (default public / 1) shows the same 54 slots in any
 dimension, opened through the vanilla 9x6 menu, and every tank on a channel holds the same 16,000 mB

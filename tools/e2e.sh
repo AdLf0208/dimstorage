@@ -17,12 +17,17 @@
 #  - a vanilla barrel with sticks never shares with either chest;
 #  - a water bucket empties into a tank and every tank on its channel shows it;
 #  - a channel-2 tank holds lava without touching channel 1's water;
-#  - an empty bucket drains a channel, and the 17th bucket is refused at 16000 mB;
+#  - a tank channel caps at 16000 mB; the 17th bucket is refused before it moves;
+#  - a drain through one tank is committed at access: with the clock frozen and the
+#    sibling removed before its next tick, a relaunch keeps exactly the drained
+#    amount (the channel is not restored from a stale saved compound);
 #  - breaking a tank drops it into a hopper and leaves the channel's fluid intact;
 #  - both store files exist and both stores survive a relaunch.
 #
 # SELFTEST=1 flips the chest sharing assertion; SELFTEST=tank flips the tank
-# sharing assertion. Each must FAIL (EXIT:1), proving the scenario can fail.
+# sharing assertion; SELFTEST=capacity flips the refused-fill assertion;
+# SELFTEST=transfer flips the drain-committed assertion. Each must FAIL (EXIT:1),
+# proving the scenario can fail.
 #
 # A native `.hmod` cannot load on an unmodded game, so GAME must name a game
 # the launcher built with this package:
@@ -45,7 +50,10 @@ CONTENT_DIR=${CONTENT_DIR:-}
 DEV_MOD=()
 [ -z "$CONTENT_DIR" ] || DEV_MOD=(--dev-mod "$CONTENT_DIR")
 RES=${RES:-${HORIZON_RES:-/home/adlf/Desktop/horizon/.local/horizon-client/26.3}}
-SOCK=${SOCK:-/tmp/opencode/dimstorage-e2e.sock}
+# `/tmp` is a small tmpfs; the launcher's env names a scratch folder on /home.
+E2E_TMP=${E2E_TMP:-/tmp/opencode}
+mkdir -p "$E2E_TMP"
+SOCK=${SOCK:-$E2E_TMP/dimstorage-e2e.sock}
 SELFTEST=${SELFTEST:-0}
 KEEP=${KEEP:-0}
 WORLD=DimStorageE2E
@@ -57,7 +65,7 @@ TANK=dimstorage:dimensional_tank
 [ -x "$GAME" ] || { echo "missing horizon-client: $GAME (set GAME=)" >&2; exit 1; }
 [ -d "$RES/assets" ] || { echo "missing prepared resources: $RES" >&2; exit 1; }
 
-SCRATCH=$(mktemp -d /tmp/opencode/dimstorage-home.XXXXXX)
+SCRATCH=$(mktemp -d "$E2E_TMP/dimstorage-home.XXXXXX")
 export HORIZON_HOME=$SCRATCH/game
 export HORIZON_LAUNCHER_HOME=$SCRATCH/launcher
 export XDG_DATA_HOME=$SCRATCH/data
@@ -118,6 +126,11 @@ expect_info() { # expect_info X Y Z TEXT
 }
 # expect_tank X Y Z TEXT: the tank readout at a position (same command, tank block).
 expect_tank() { expect_info "$@"; }
+# The tank's own saved compound (its `fluids` path), spaces removed so the SNBT
+# shape (`{Amount: 15000, Fluid: "minecraft:water"}`) is easy to assert on.
+tank_compound() { # tank_compound X Y Z
+    ctl command "data get block $1 $2 $3 fluids" | jq -r '.chat[]?' | head -1 | tr -d ' '
+}
 
 # Fill the tank at X Y Z from the hotbar item (a bucket), then let the store settle.
 use_on() { # use_on ITEM X Y Z
@@ -442,17 +455,78 @@ for _ in $(seq 1 16); do
 done
 expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
 echo "  water buckets left after 16 fills: $(inv_count minecraft:water_bucket)"
-# The 17th bucket does not fit: the interaction is refused, the tank stays at its
-# cap and the bucket is not emptied.
+# The 17th bucket does not fit: the interaction is refused before anything moves,
+# the tank stays at its cap and the bucket is not emptied. The tank's own saved
+# compound is read too, so the refusal is proven on both sides of the capability.
 ctl command "item replace entity @s hotbar.0 with minecraft:water_bucket 1"
 ctl wait 4
 stand 0 100 8
 before17=$(inv_count minecraft:water_bucket)
+compound_before=$(tank_compound 0 100 8)
+echo "  block compound before the 17th fill: $compound_before"
 use_on minecraft:water_bucket 0 100 8
 after17=$(inv_count minecraft:water_bucket)
+compound_after=$(tank_compound 0 100 8)
 echo "  water buckets around the refused 17th fill: $before17 -> $after17"
 [ "$after17" = "$before17" ] || fail "the 17th bucket was emptied into a full tank ($before17 -> $after17)"
-expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+[ "$compound_after" = "$compound_before" ] \
+    || fail "the refused 17th fill changed the tank's own compound: '$compound_before' -> '$compound_after'"
+case "$compound_after" in
+    *Amount:16000*minecraft:water*|*minecraft:water*Amount:16000*) ;;
+    *) fail "the full tank's own compound reads '$compound_after', not 16000 of water" ;;
+esac
+if [ "$SELFTEST" = capacity ]; then
+    # Deliberately wrong: a refused fill does not raise the channel past its cap.
+    echo "(selftest: asserting the channel took the refused 17th bucket)"
+    expect_tank 0 100 8 "public / 1 (17000 / 16000 mB of minecraft:water)"
+else
+    expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+fi
+
+echo "== a drain is committed at access; a stale sibling cannot restore it =="
+# Freeze the clock so no block entity ticks between draining a bucket through tank
+# A (0,100,8) and removing sibling B (4,100,8). B's saved compound then still says
+# 16,000 while the channel has lost the bucket — the restart the review names.
+# The drain must be in the channel before the click reports success.
+ctl command "tick freeze" >/dev/null
+sleep 1
+stand 0 100 8
+ctl command "item replace entity @s hotbar.0 with minecraft:bucket 1" >/dev/null
+sleep 1
+ctl select minecraft:bucket >/dev/null
+ctl interact 0 100 8 >/dev/null || fail "using the empty bucket on the tank failed"
+sleep 2
+ctl command "execute in minecraft:overworld run setblock 4 100 8 minecraft:air" >/dev/null
+sleep 1
+frozen_buckets=$(inv_count minecraft:water_bucket)
+echo "  water buckets after the frozen drain: $frozen_buckets"
+[ "$frozen_buckets" = 1 ] || fail "the frozen drain gave $frozen_buckets water buckets, expected 1"
+if [ "$SELFTEST" = transfer ]; then
+    # Deliberately wrong: the drain is committed, so the channel holds 15,000.
+    drained=16000
+else
+    drained=15000
+fi
+frozen_compound=$(tank_compound 0 100 8)
+echo "  block compound before the relaunch: $frozen_compound"
+case "$frozen_compound" in
+    *"Amount:$drained"*minecraft:water*|*minecraft:water*"Amount:$drained"*) ;;
+    *) fail "the drained tank's own compound reads '$frozen_compound', not $drained of water" ;;
+esac
+ctl save >/dev/null
+ctl quit >/dev/null 2>&1 || true
+sleep 3
+launch
+expect_tank 0 100 8 "public / 1 ($drained / 16000 mB of minecraft:water)"
+compound=$(tank_compound 0 100 8)
+echo "  block compound after the relaunch: $compound"
+case "$compound" in
+    *"Amount:$drained"*minecraft:water*|*minecraft:water*"Amount:$drained"*) ;;
+    *) fail "after the relaunch the drained tank's own compound reads '$compound', not $drained of water" ;;
+esac
+[ "$(ctl block 4 100 8 | jq -r '.block // .name // empty')" = "minecraft:air" ] \
+    || fail "the sibling tank at 4,100,8 was not removed"
+echo "  the channel stayed at $drained mB after removing the stale sibling and relaunching"
 
 has 0 100 0 minecraft:diamond 7
 echo "== breaking a tank drops it (survival) and leaves the store intact =="
@@ -475,12 +549,12 @@ ctl command "gamemode creative @s"
 ctl wait 4
 has 2 99 12 "$TANK" 1
 echo "  hopper(2,99,12)=$(slots 2 99 12)"
-expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+expect_tank 0 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
 has 0 100 0 minecraft:diamond 7
 expect_info 0 100 0 "public / 1"
 ctl command "execute in minecraft:overworld run setblock 2 100 12 $TANK"
 ctl wait 10
-expect_tank 2 100 12 "public / 1 (16000 / 16000 mB of minecraft:water)"
+expect_tank 2 100 12 "public / 1 (15000 / 16000 mB of minecraft:water)"
 echo "  a fresh tank found the channel's water after the break"
 
 echo "== every carried loot table rolls its own item =="
@@ -510,7 +584,7 @@ grep -q 'f public,2' "$STORE" || fail "the store file has no public/2 frequency:
 if grep -q 'f public,3' "$STORE"; then
     fail "the store kept the empty public/3 channel: $(head -20 "$STORE")"
 fi
-grep -q 't public,1 minecraft:water 16000' "$TANKS" \
+grep -q 't public,1 minecraft:water 15000' "$TANKS" \
     || fail "the tank file has no public/1 water: $(head -20 "$TANKS")"
 grep -q 't public,2 minecraft:lava 1000' "$TANKS" \
     || fail "the tank file has no public/2 lava: $(head -20 "$TANKS")"
@@ -529,8 +603,8 @@ has 8 100 0 minecraft:emerald 3
 empty 16 100 0
 expect_info 0 100 0 "public / 1"
 expect_info 8 100 0 "public / 2"
-expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+expect_tank 0 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
 expect_tank 8 100 8 "public / 2 (1000 / 16000 mB of minecraft:lava)"
 expect_tank 20 100 8 "(0 / 16000 mB, empty)"
 
-echo "PASS: the tank recipe crafted and placed, same-channel tanks shared one fluid while another channel held its own, an empty bucket drained the channel, a channel capped at 16000 mB and refused the 17th bucket, a broken tank dropped into a hopper with its fluid intact, same-frequency chests shared 54 slots, a vanilla barrel never shared, and both stores survived a relaunch"
+echo "PASS: the tank recipe crafted and placed, same-channel tanks shared one fluid while another channel held its own, an empty bucket drained the channel, a channel capped at 16000 mB and refused the 17th bucket before anything moved, a frozen-clock drain through one tank was committed at access and a removed stale sibling could not restore it across a relaunch (the channel read exactly 15000 mB in its own compound and in the store), a broken tank dropped into a hopper with its fluid intact, same-frequency chests shared 54 slots, a vanilla barrel never shared, and both stores survived a relaunch"

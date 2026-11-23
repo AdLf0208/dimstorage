@@ -24,15 +24,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mod_api::{
     BlockEntityPart, BlockEntityRef, BlockEntityTickEvent, BlockEntityTicksEvent, BlockPart,
     BlockState, Command, CommandArgumentValue, CommandInvocation, CommandSource, Compound, Flow,
-    GameMode, Hand, Host, HostTransaction, Identifier, InteractionResult, ItemKey, ItemPlace,
-    ItemResource, ItemStack, LevelRef, ModContainer, ModFluidTanks, PlayerRef, Registrar,
-    RunModCommandEvent, ServerHost, ServerTickEvent, ServerTickPhase, Tag, Text,
-    WorldLifecycleEvent, WorldPhase,
+    FluidResource, FluidStack, GameMode, Hand, Host, HostTransaction, ITEM_FLUIDS, Identifier,
+    InteractionResult, ItemKey, ItemPlace, ItemResource, ItemStack, LevelRef, ModContainer,
+    ModFluidTanks, PlayerRef, Registrar, RunModCommandEvent, ServerHost, ServerTickEvent,
+    ServerTickPhase, Tag, Text, WorldLifecycleEvent, WorldPhase,
 };
 
 use crate::runtime::{
     Frequency, MAX_STACK, SLOTS, Slot, Stack, Store, TANK_CAPACITY, Tank, TankFluid, TankStore,
-    commit, may_read, switch, sync, take_allowed, tank_switch, tank_sync,
+    commit, may_read, switch, sync, take_allowed, tank_switch, tank_sync, tank_transfer,
 };
 
 /// The dimensional chest of slice 1 (its item has the same id).
@@ -225,8 +225,6 @@ struct Core {
     /// Each chest's last synced slots, by its own uid (it moves with the block entity, so a piston
     /// move does not confuse the merge).
     snapshots: HashMap<u64, Vec<Option<StoredItem>>>,
-    /// Each tank's last synced contents, by its own uid, as the chests' snapshots.
-    tank_snapshots: HashMap<u64, Tank>,
     /// Frequencies a chest must take from `/dimstorage channel`; the block entity is not in the
     /// world when the command runs.
     pending: Vec<(String, [i32; 3], Frequency)>,
@@ -246,7 +244,6 @@ impl Default for Core {
             store: Store::new(),
             tanks: TankStore::new(),
             snapshots: HashMap::new(),
-            tank_snapshots: HashMap::new(),
             pending: Vec::new(),
             mirrors: BTreeMap::new(),
             dirty: false,
@@ -406,7 +403,6 @@ fn ensure_world(host: &mut dyn ServerHost) {
     state.store = load_store(&dir);
     state.tanks = load_tanks(&dir);
     state.snapshots.clear();
-    state.tank_snapshots.clear();
     state.pending.clear();
     state.dirty = false;
     state.ticks = 0;
@@ -429,7 +425,6 @@ fn close_world(save: bool) {
         state.store = Store::new();
         state.tanks = TankStore::new();
         state.snapshots.clear();
-        state.tank_snapshots.clear();
         state.pending.clear();
         state.dirty = false;
     }
@@ -754,16 +749,10 @@ fn tick_chest(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
 /// channel into the entity's `fluids` list, and the bucket interaction on use.
 pub struct TankBlock;
 
-/// The tank's contents from its saved compound: the first `fluids` entry, in the
-/// `Fluid`/`Amount` shape the game's fluid capability reads and writes
-/// (millibuckets, an empty tank spelled `minecraft:empty` with amount 0).
-fn read_tank(nbt: &Compound) -> Tank {
-    let Some(Tag::List(list)) = nbt.get(&"fluids".into()) else {
-        return None;
-    };
-    let Some(Tag::Compound(map)) = list.first() else {
-        return None;
-    };
+/// One tank entry from a `Fluid`/`Amount` compound: the shape the game's fluid
+/// capability reads and writes (millibuckets, empty spelled `minecraft:empty`
+/// with amount 0).
+fn read_entry(map: &Compound) -> Tank {
     let id = match map.get(&"Fluid".into()) {
         Some(Tag::String(id)) if id.to_string_lossy() != "minecraft:empty" => id.to_string_lossy(),
         _ => return None,
@@ -775,8 +764,8 @@ fn read_tank(nbt: &Compound) -> Tank {
     (amount > 0).then(|| TankFluid::new(id, amount))
 }
 
-/// Write a tank's contents into the saved compound, one entry for the one tank.
-fn set_tank(nbt: &mut Compound, tank: &Tank) {
+/// A tank entry, as the game's `fluids` list holds one.
+fn entry(tank: &Tank) -> Compound {
     let mut map = Compound::new();
     map.insert(
         "Fluid".into(),
@@ -790,14 +779,54 @@ fn set_tank(nbt: &mut Compound, tank: &Tank) {
         "Amount".into(),
         Tag::Int(tank.as_ref().map_or(0, |fluid| fluid.amount)),
     );
-    nbt.insert("fluids".into(), Tag::List(vec![Tag::Compound(map)]));
+    map
+}
+
+/// The tank's contents from its saved compound: the first `fluids` entry.
+fn read_tank(nbt: &Compound) -> Tank {
+    let Some(Tag::List(list)) = nbt.get(&"fluids".into()) else {
+        return None;
+    };
+    let Some(Tag::Compound(map)) = list.first() else {
+        return None;
+    };
+    read_entry(map)
+}
+
+/// Write a tank's contents into the saved compound, one entry for the one tank.
+fn set_tank(nbt: &mut Compound, tank: &Tank) {
+    nbt.insert("fluids".into(), Tag::List(vec![Tag::Compound(entry(tank))]));
+}
+
+/// What the channel held when this tank last synced, saved beside the mirror: the
+/// delta since then is a transfer the channel has not committed yet (a pipe, a
+/// crash between the handler and the tick). `None` for a tank with no marker (a
+/// fresh block, or one saved by 0.2.3).
+fn read_synced(nbt: &Compound) -> Option<Tank> {
+    match nbt.get(&"synced".into()) {
+        Some(Tag::Compound(map)) => Some(read_entry(map)),
+        _ => None,
+    }
+}
+
+fn set_synced(nbt: &mut Compound, tank: &Tank) {
+    nbt.insert("synced".into(), Tag::Compound(entry(tank)));
+}
+
+/// Free millibuckets for `id` in the channel.
+fn channel_room(frequency: &Frequency, id: &str) -> i32 {
+    let guard = core();
+    guard
+        .as_ref()
+        .map_or(TANK_CAPACITY, |state| state.tanks.room(frequency, id))
 }
 
 #[mod_api::horizon_part]
 impl BlockPart for TankBlock {
     /// A bucket (or any fluid container) on the tank: empty it in, or fill it out,
     /// through the game's own fluid handler over this block's `fluids` capability,
-    /// so the bucket's item, sound and game event are vanilla's.
+    /// so the bucket's item, sound and game event are vanilla's. The transfer is
+    /// committed to the channel's one balance before this reports success.
     fn use_item_on(
         &self,
         host: &mut dyn ServerHost,
@@ -810,7 +839,7 @@ impl BlockPart for TankBlock {
 #[mod_api::horizon_part]
 impl BlockEntityPart for TankBlock {
     /// A fresh tank starts on the default public/1 frequency, as upstream's
-    /// `new Frequency()`; its `fluids` list is written by the first tick.
+    /// `new Frequency()`; its `fluids` list is written by the first sync.
     fn block_entity(
         &self,
         _level: mod_api::LevelSide,
@@ -830,21 +859,45 @@ impl BlockEntityPart for TankBlock {
     }
 }
 
+/// What a click's container may do with the channel before the game's handler runs.
+enum TankMove {
+    /// Let the handler attempt the whole transfer.
+    Whole,
+    /// The hand holds no fluid container; the handler decides.
+    NotFluid,
+    /// The transfer cannot complete; say why and consume the click.
+    Refused(&'static str),
+}
+
 /// The body of the tank's `use_item_on`.
 fn tank_use(host: &mut dyn ServerHost, event: &mod_api::UseItemOnEvent<'_>) -> InteractionResult {
     let click = event.click;
     let Some(level) = host.level(click.dimension.key().id()) else {
         return InteractionResult::Pass;
     };
-    // Bring this tank's copy up to the channel's truth before the handler reads
-    // it: a sibling may have filled or drained it since this tank's last tick.
-    sync_tank_at(host, level, click.pos);
+    // Bring this tank's copy up to the channel's truth before anything reads it:
+    // a sibling may have filled or drained it since this tank's last tick.
+    let Some((frequency, before, channel)) = sync_tank_at(host, level, click.pos) else {
+        return InteractionResult::Pass;
+    };
     let Some(player) = host.player(click.player) else {
         return InteractionResult::Pass;
     };
+    match tank_move(host, click, &frequency, &channel) {
+        TankMove::Refused(line) => {
+            // A capacity refusal is decided before the handler moves anything, and
+            // the click is consumed so the held bucket does not try the world.
+            say(host, line);
+            return InteractionResult::Success;
+        }
+        TankMove::Whole | TankMove::NotFluid => {}
+    }
     if mod_api::fluid_util::interact_with_fluid_handler(
         host, player, click.hand, level, click.pos, None,
     ) {
+        // The handler moved fluid into or out of this tank's copy. Commit that
+        // delta to the channel's one balance now, before success is reported.
+        commit_tank_at(host, level, click.pos, &before);
         return InteractionResult::Success;
     }
     if click.stack.is_some() {
@@ -858,9 +911,89 @@ fn tank_use(host: &mut dyn ServerHost, event: &mod_api::UseItemOnEvent<'_>) -> I
     InteractionResult::Success
 }
 
+/// Decide whether the held container's whole transfer fits the channel, using the
+/// item's own fluid handler: a fill needs as much free room as the container
+/// holds, and a drain needs the channel to fill a container of its fluid.
+fn tank_move(
+    host: &mut dyn ServerHost,
+    click: &mod_api::BlockClick<'_>,
+    frequency: &Frequency,
+    channel: &Tank,
+) -> TankMove {
+    let place = ItemPlace::PlayerHand {
+        player: click.player,
+        hand: click.hand,
+    };
+    let Some(handler) = place.capability(host, &ITEM_FLUIDS) else {
+        return TankMove::NotFluid;
+    };
+    let held = (0..handler.size(host))
+        .find_map(|index| handler.resource(host, index).map(|fluid| (index, fluid)));
+    if let Some((index, fluid)) = held {
+        let Some(key) = fluid.fluid().key() else {
+            return TankMove::NotFluid;
+        };
+        let id = key.id(&*host);
+        let amount = i32::try_from(handler.amount(host, index)).unwrap_or(i32::MAX);
+        if amount > channel_room(frequency, &id) {
+            return TankMove::Refused("The channel has no room for that much fluid.");
+        }
+        return TankMove::Whole;
+    }
+    // An empty container to fill: the channel must give a whole load of its fluid.
+    let Some(channel) = channel else {
+        return TankMove::Whole;
+    };
+    let Some(key) = host.fluid_key(&channel.id) else {
+        return TankMove::Whole;
+    };
+    let resource = FluidResource::of(&FluidStack::new(key, 1));
+    let capacity = (0..handler.size(host))
+        .map(|index| handler.capacity(host, index, &resource))
+        .max()
+        .unwrap_or(0);
+    if capacity > 0 && u32::try_from(channel.amount).unwrap_or(0) < capacity {
+        return TankMove::Refused("The channel does not hold enough fluid for that.");
+    }
+    TankMove::Whole
+}
+
 /// Mirror the tank at `pos` with the channel store before an access, as the
-/// chest's `contents_changed` commits its own at the point of access.
-fn sync_tank_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) {
+/// chest's `contents_changed` commits its own at the point of access. Answers the
+/// channel's value (what the tank now shows).
+fn sync_tank_at(
+    host: &mut dyn ServerHost,
+    level: LevelRef,
+    pos: [i32; 3],
+) -> Option<(Frequency, Tank, Tank)> {
+    ensure_world(host);
+    let entity = our_tank_entity(&*host, level, pos)?;
+    let mut nbt = entity.data(&*host)?;
+    let frequency = be_frequency(&mut nbt);
+    let current = read_tank(&nbt);
+    let snapshot = read_synced(&nbt);
+    let (out, channel) = {
+        let mut guard = core();
+        let state = guard.get_or_insert_with(Core::default);
+        let synced = tank_sync(&current, snapshot.as_ref(), &mut state.tanks, &frequency);
+        if synced.store_changed {
+            state.dirty = true;
+        }
+        (synced.tank, state.tanks.get(&frequency))
+    };
+    let mut data = Compound::new();
+    set_tank(&mut data, &out);
+    // The marker is the channel's value, never a local excess: a capability fill
+    // the channel could not take stays visible in `fluids` and is drained first,
+    // so it is not destroyed by the next sync.
+    set_synced(&mut data, &channel);
+    let _ = entity.merge_data(host, data);
+    Some((frequency, out, channel))
+}
+
+/// Commit a transfer the game's handler just made in this tank's copy to the
+/// channel, then write the channel's balance back into that copy.
+fn commit_tank_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], before: &Tank) {
     let Some(entity) = our_tank_entity(&*host, level, pos) else {
         return;
     };
@@ -868,36 +1001,38 @@ fn sync_tank_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3]) {
         return;
     };
     let frequency = be_frequency(&mut nbt);
-    let uid = be_uid(&mut nbt);
-    let current = read_tank(&nbt);
-    let out = {
+    let after = read_tank(&nbt);
+    if &after == before {
+        return;
+    }
+    let tank = {
         let mut guard = core();
         let state = guard.get_or_insert_with(Core::default);
-        let snapshot = state.tank_snapshots.get(&uid).cloned();
-        let synced = tank_sync(&current, snapshot.as_ref(), &mut state.tanks, &frequency);
-        if synced.store_changed {
+        let transfer = tank_transfer(before, &after, &mut state.tanks, &frequency);
+        if transfer.committed {
             state.dirty = true;
         }
-        state.tank_snapshots.insert(uid, synced.tank.clone());
-        synced.tank
+        transfer.tank
     };
-    if out != current {
-        let mut data = Compound::new();
-        set_tank(&mut data, &out);
-        let _ = entity.merge_data(host, data);
-    }
+    let mut data = Compound::new();
+    set_tank(&mut data, &tank);
+    set_synced(&mut data, &tank);
+    let _ = entity.merge_data(host, data);
 }
 
 /// One server tick of a tank: apply a queued frequency, then merge its contents
-/// with the channel store.
+/// with the channel store. A capability transfer since the last sync (a pipe, or
+/// a crash between the handler and this tick) is the delta against the saved
+/// marker, so a drained channel is never re-seeded by a stale copy.
 fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
     ensure_world(host);
     let pos = event.pos;
     let dimension = host.dimension().to_owned();
     let mut frequency = be_frequency(&mut event.entity.nbt);
-    let uid = be_uid(&mut event.entity.nbt);
     let current = read_tank(&event.entity.nbt);
+    let mut snapshot = read_synced(&event.entity.nbt);
     let mut out = current.clone();
+    let channel;
     {
         let mut guard = core();
         let state = guard.get_or_insert_with(Core::default);
@@ -908,7 +1043,6 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
         {
             let (_, _, wanted) = state.pending.remove(index);
             if wanted != frequency {
-                let snapshot = state.tank_snapshots.get(&uid).cloned();
                 let (tank, changed) = tank_switch(
                     &current,
                     snapshot.as_ref(),
@@ -919,22 +1053,25 @@ fn tick_tank(host: &mut dyn ServerHost, event: &mut BlockEntityTickEvent<'_>) {
                 if changed {
                     state.dirty = true;
                 }
-                state.tank_snapshots.insert(uid, tank.clone());
-                out = tank;
+                out = tank.clone();
+                snapshot = Some(tank);
                 set_be_frequency(&mut event.entity.nbt, &wanted);
                 frequency = wanted;
             }
         }
-        let snapshot = state.tank_snapshots.get(&uid).cloned();
         let synced = tank_sync(&out, snapshot.as_ref(), &mut state.tanks, &frequency);
         if synced.store_changed {
             state.dirty = true;
         }
-        state.tank_snapshots.insert(uid, synced.tank.clone());
         out = synced.tank;
+        channel = state.tanks.get(&frequency);
     }
-    if out != current {
+    if out != current || snapshot.as_ref() != Some(&channel) {
         set_tank(&mut event.entity.nbt, &out);
+        // As at an access: the marker is the channel's value, so a capability
+        // fill the channel could not take stays in `fluids` instead of being
+        // clamped away by the next sync.
+        set_synced(&mut event.entity.nbt, &channel);
     }
 }
 
@@ -1090,16 +1227,52 @@ fn is_chest(host: &dyn Host, state: BlockState) -> bool {
     host.block_key(BLOCK) == Some(state.block())
 }
 
-/// A player broke a chest: commit and empty it, so the store keeps the contents and the block drops
-/// through its ordinary loot table without a second copy.
+/// Whether a state is the tank block.
+fn is_tank(host: &dyn Host, state: BlockState) -> bool {
+    host.block_key(TANK_BLOCK) == Some(state.block())
+}
+
+/// A tank about to be removed: commit the transfer it made since its last sync
+/// to the channel before the block (and its `fluids` compound) goes. A tank's
+/// fluid lives in the channel, never in the block, so nothing is emptied here.
+fn commit_tank(host: &mut dyn ServerHost, pos: [i32; 3]) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let Some(entity) = our_tank_entity(&*host, level, pos) else {
+        return;
+    };
+    let Some(nbt) = entity.data(&*host) else {
+        return;
+    };
+    let frequency = read_frequency(&nbt);
+    let mirror = read_tank(&nbt);
+    let mut guard = core();
+    let state = guard.get_or_insert_with(Core::default);
+    let changed = match read_synced(&nbt) {
+        Some(snapshot) => tank_transfer(&snapshot, &mirror, &mut state.tanks, &frequency).committed,
+        // A tank saved by 0.2.3 (no marker): its compound is the only copy, so an
+        // unknown channel is seeded from it; a known one is never overwritten.
+        None => !state.tanks.knows(&frequency) && state.tanks.set(&frequency, mirror),
+    };
+    if changed {
+        state.dirty = true;
+    }
+}
+
+/// A player broke a chest or a tank: commit it, so the store keeps the contents
+/// and the block drops through its ordinary loot table without a second copy. A
+/// chest's slots are also emptied; a tank's fluid stays in the channel.
 pub fn break_block(host: &mut dyn ServerHost, event: &mut mod_api::BreakBlockEvent<'_>) -> Flow {
     if is_chest(&*host, event.state) {
         commit_and_empty(host, event.pos);
+    } else if is_tank(&*host, event.state) {
+        commit_tank(host, event.pos);
     }
     Flow::Continue
 }
 
-/// An explosion about to break chests: the same commit and empty for each one.
+/// An explosion about to break chests or tanks: the same commit for each one.
 pub fn explosion_detonate(
     host: &mut dyn ServerHost,
     event: &mut mod_api::ExplosionDetonateEvent<'_>,
@@ -1107,18 +1280,21 @@ pub fn explosion_detonate(
     let Some(level) = host.level(host.dimension()) else {
         return;
     };
-    let found: Vec<[i32; 3]> = event
+    let found: Vec<([i32; 3], bool, bool)> = event
         .blocks
         .iter()
-        .filter(|pos| {
+        .filter_map(|pos| {
             level
-                .block_state(&*host, **pos)
-                .is_some_and(|state| is_chest(&*host, state))
+                .block_state(&*host, *pos)
+                .map(|state| (*pos, is_chest(&*host, state), is_tank(&*host, state)))
         })
-        .copied()
         .collect();
-    for pos in found {
-        commit_and_empty(host, pos);
+    for (pos, chest, tank) in found {
+        if chest {
+            commit_and_empty(host, pos);
+        } else if tank {
+            commit_tank(host, pos);
+        }
     }
 }
 
@@ -1606,6 +1782,28 @@ mod tests {
             Some(&Tag::String("minecraft:empty".into()))
         );
         assert_eq!(entry.get(&"Amount".into()), Some(&Tag::Int(0)));
+    }
+
+    #[test]
+    fn the_tanks_synced_marker_round_trips_and_distinguishes_no_marker() {
+        // The marker is what the channel held when this tank last synced: a tank
+        // with none (0.2.3, or a fresh block) may seed an unknown channel, and one
+        // with a marker may only commit its delta. An empty marker is meaningful.
+        let mut nbt = Compound::new();
+        assert_eq!(read_synced(&nbt), None, "no marker at all");
+
+        set_synced(&mut nbt, &Some(TankFluid::new("minecraft:water", 4000)));
+        assert_eq!(
+            read_synced(&nbt),
+            Some(Some(TankFluid::new("minecraft:water", 4000)))
+        );
+
+        set_synced(&mut nbt, &None);
+        assert_eq!(
+            read_synced(&nbt),
+            Some(None),
+            "synced empty is not no marker"
+        );
     }
 
     #[test]
