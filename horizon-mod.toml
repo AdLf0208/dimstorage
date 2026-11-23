@@ -1,13 +1,14 @@
 id = "dimstorage"
 name = "DimStorage"
-version = "0.2.4"
+version = "0.2.5"
 description = """A port of DimStorage for Horizon: the dimensional chest and the dimensional tank.
 Every chest on the same public frequency (default public / 1) shows the same 54 slots in any
 dimension, opened through the vanilla 9x6 menu, and every tank on a channel holds the same 16,000 mB
 of fluid, filled and drained with buckets; both stores are world-global and persisted in
-<world>/dimstorage/. /dimstorage channel|info|put|take are the headless fallbacks for the deferred
-frequency screen. The tablet, the owner/lock/frequency screen, the custom renderer, the tank's screen
-and comparator and the remaining cosmetics are not ported yet."""
+<world>/dimstorage/. A channel the world cannot create (a new frequency at the store's channel cap)
+is refused before a bucket moves. /dimstorage channel|info|put|take are the headless fallbacks for
+the deferred frequency screen. The tablet, the owner/lock/frequency screen, the custom renderer, the
+tank's screen and comparator and the remaining cosmetics are not ported yet."""
 authors = ["Edivad99", "AdLf0208"]
 # The original's licence: AGPL-3.0-only (Edivad99/DimStorage); its text and the provenance notice
 # travel inside the package as LICENSE / LICENSE-NOTICE.md.

@@ -1017,4 +1017,194 @@ The freeze is what makes the second assertion fail-capable: without it, the sibl
 > before the tick, restart after draining and capacity rejection. Chest behaviour is unchanged;
 > pin `0a875da` / mixins `e59da90`.
 
+## Slice 4 — the channel-count refusal (0.2.5)
+
+**The review this closes.** `NikitaMGrimm` accepted the 0.2.4 bucket-synchronisation work and found
+one remaining data-loss path:
+
+> The store's **channel-count limit** can still lose a bucket's contents. At that limit,
+> `TankStore::room` reports **full capacity for an unknown frequency even though `set` refuses
+> it**. The bucket handler accepts the transfer, then `tank_commit` ignores the failed store write
+> and the tank is overwritten with the empty store balance.
+
+Two defects in one path, both fixed here, plus the message that made them invisible:
+
+1. **A channel the store cannot admit has no room.** `TankStore::room` answered `TANK_CAPACITY` for
+   any frequency without a fluid entry, including a **new** one at `MAX_CHANNELS`, which `set`
+   refuses. The bucket pre-check therefore accepted a fill the store could never take.
+2. **A refused store write is reported, not ignored.** `tank_commit` returned "changed" for a write
+   `set` refused, and `tank_transfer` handed back `store.get(frequency)` — the empty balance — which
+   `commit_tank_at` then wrote over the tank's own copy. The bucket's fluid was gone.
+3. **The refusal was silent in game.** The refusal line went through `commands().feedback`, the
+   *command's* answer, which has no source during a block click; the 0.2.4 "answers a message" claim
+   was never asserted in game and never reached the player. 0.2.5 sends system lines to the clicking
+   player (`PlayerRef::tell`), which the e2e now proves.
+
+This is a behaviour fix on the `machines` tier's existing tank capability — no new family, no
+renderer, no client half.
+
+### What changed
+
+- **`runtime::TankStore::admits`** — a known channel may hold fluid, a new one only while the store
+  is below `MAX_CHANNELS`. `room` answers `0` for one it cannot admit (and `fill` reports only what
+  `set` really took), so the pre-move refusal fires for the right reason.
+- **`runtime::TankWrite`** — `tank_commit` now answers `{ changed, refused }` instead of a bare
+  bool: `set` returning false after a real difference *is* a refusal (an equal value returns
+  earlier), so a caller can no longer mistake it for a stored value.
+- **`runtime::TankTransfer { tank, channel, committed, refused }`** — a refused write keeps the
+  tank's own value in `tank` and the store's value in `channel`, so the marker stays the channel's
+  truth while the fluid survives in the block. `tank_sync` now takes `set`'s answer for
+  `store_changed`, so a refused retry never marks the store dirty (which would have saved a store
+  that did not move, every second, forever).
+- **`support::channel_admits` + a distinct message** ("This world already holds as many fluid
+  channels as it can.") so the player is told the real reason, not "no room for that much fluid".
+- **`support::tell`** — system lines from a block click go to the clicking player. The same helper
+  fixes the empty-hand readout, which had been silent since slice 2 for the same reason.
+- `src/runtime.rs` counts **38** tests and `src/support.rs` **9** (47 total); 0.2.4's record said
+  41/4, which was a miscount, not a change.
+
+### TDD: the two red tests, verbatim
+
+Added to `src/runtime.rs` before the glue; `room`/`tank_transfer` still had the 0.2.4 behaviour and
+both failed for their stated reason. Quoted from `../_shared/evidence/dimstorage/sdk-test-channel-red.log`:
+
+```
+---- runtime::tests::a_channel_the_store_cannot_admit_has_no_room stdout ----
+thread '...a_channel_the_store_cannot_admit_has_no_room' (698989) panicked at src/runtime.rs:1667:9:
+assertion `left == right` failed: a channel the store cannot admit has no room, not full capacity
+  left: 16000
+ right: 0
+
+---- runtime::tests::a_refused_store_write_keeps_the_tanks_own_fluid stdout ----
+thread '...a_refused_store_write_keeps_the_tanks_own_fluid' (698991) panicked at src/runtime.rs:1694:9:
+a store write the channel refused is not reported as committed
+
+test result: FAILED. 45 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+The test bodies are the contract: a store holding exactly `MAX_CHANNELS` known channels admits no
+new one (`room` 0, `transfer_in` false, nothing stored) while a known channel keeps its room; and a
+transfer whose write is refused reports `committed: false`, `refused: true`, keeps the tank's 1,000
+mB and leaves the channel's marker empty. The failure message for the message path was in game:
+0.2.4's first 0.2.5 run printed `the player was told: (nothing)` (quoted under the in-game leg).
+
+### Ladder (0.2.5, pin `0a875da91dbb0fdcb7ba8c42c11341aa229af51a`, mixins `e59da909…`)
+
+Every step ran through `ports/tools/build-slot.sh` with `CARGO_INCREMENTAL=0`; the SDK project has no
+staged tree, so local steps used `BUILD_LOCAL=1`. The build printed `SDK 0a875da (build
+0a875da91dbb…)`.
+
+| Step | Result | Evidence |
+|---|---|---|
+| red (TDD) | `45 passed; 2 failed` — both new tests, for the reasons above | `sdk-test-channel-red.log` |
+| red→green (glue) | `47 passed` | `sdk-test-channel-green.log` |
+| `cargo test --offline` | **47 passed**, 0 failed (38 `runtime::`, 9 `support::`) | `sdk-test.log` |
+| `cargo clippy --all-targets --offline -- -D warnings` | exit 0, **0 warnings** | `sdk-clippy-0.2.5.log` |
+| `cargo fmt --check` | `fmt_exit=0` | `sdk-fmt-0.2.5.log` |
+| build 1 (`rm -f Cargo.lock` first) | **88,786 B**, sha256 `74a967bc…f77f` | `sdk-build-0.2.5.log` |
+| build 2 (same) | **`cmp: identical`** | `sdk-build-second-0.2.5.log` |
+| `cargo horizon-mod check dimstorage.hmod` | exit 0, `dimstorage 0.2.5 (native-mod, format native-1/0a875da…/e59da90…, for 26.3)` | `sdk-check-0.2.5.log` |
+| `cargo horizon-mod fits … --build 0a875da` | `0a875da  made for` | `sdk-fits-0.2.5.log` |
+| `cargo horizon-mod fits … --build 0b14f8a` | `0b14f8a  fits` | `sdk-fits-other-0.2.5.log` |
+| `python3 ports/tools/verify-sdk-package.py dimstorage` | **1/1** | `sdk-verify-0.2.5.log` |
+
+Artifact: **88,786 B**, SHA-256 `74a967bc259bf53c4478a15a235534ee7af1e27f9c785a4e1065ed5a107af77f`,
+**64 entries** (same layout as 0.2.4: 5 root documents, 3 `src/`, 31 `assets/dimstorage/`, 1
+`data/c/`, 21 `data/dimstorage/`, 2 `data/minecraft/`, `uses.json`), **no `Cargo.lock`**. README and
+the manifest description were edited **before** the final build, so the archive is the tree.
+
+Every `check`/`fits`/`build` log prints the artifact sha256 it ran against.
+
+### In-game leg (launcher-built game, `launcher-game.sh build dimstorage`)
+
+`Compiling dimstorage (1 of 1)` in `../_shared/evidence/dimstorage-e2e/launcher-build-0.2.5.log`
+(the manifest was bumped and the archive changed), then
+`build-slot.sh run --job W1-dimstorage --port ports/dimstorage --step e2e -- bash tools/e2e.sh`.
+
+The new leg grows the store to its channel cap **through the mod's own file format**: the run saves
+and quits, `tools/e2e.sh` appends `e public,<n>` markers until `tanks.dat` knows exactly 4,096
+channels, and relaunches. The tank at 20,100,8 is retuned to a channel the store has never known
+(`public / 9000`), then a full water bucket is clicked on it, and the differential is the same click
+after retuning to the known channel 1:
+
+```
+== at the channel cap, a new channel is refused before the bucket moves ==
+  seeded …/saves/DimStorageE2E/dimstorage/tanks.dat to 4096 channels (cap 4096)
+  info(0,100,8): DimStorage tank: public / 1 (15000 / 16000 mB of minecraft:water)
+  info(20,100,8): DimStorage tank: public / 9000 (0 / 16000 mB, empty)
+  water buckets before the refused click: 2
+  water buckets after the refused click: 2 -> 2
+  the tank compound after the refused click: 20,100,8hasthefollowingblockdata:[{Amount:0,Fluid:"minecraft:empty"}]
+  the player was told: This world already holds as many fluid channels as it can.
+  info(20,100,8): DimStorage tank: public / 9000 (0 / 16000 mB, empty)
+  info(0,100,8): DimStorage tank: public / 1 (15000 / 16000 mB of minecraft:water)
+  the tank holds nothing, the bucket is still full and channel 1 is unchanged
+== the differential: the same click on a known channel lands ==
+  info(20,100,8): DimStorage tank: public / 1 (15000 / 16000 mB of minecraft:water)
+  info(20,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+  info(0,100,8): DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+  the tank compound after the known-channel click: 20,100,8hasthefollowingblockdata:[{Amount:16000,Fluid:"minecraft:water"}]
+  the store still knows 4096 channels, no public,9000, and channel 1 reads 16000
+== an empty-hand click reads the channel back to the player ==
+  the player read back: DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)
+```
+
+The main leg ends `PASS` + `EXIT:0` (`e2e-launcher.log`). The control — the same script with
+`GAME=$CONTROL_GAME` on the Nightly **without** the package — fails at the craft and exits 1
+(`e2e-launcher-control.log`); `SELFTEST=1` exits 1 at the chest sharing (`-selftest.log`),
+`SELFTEST=tank` at the sibling tank (`-selftest-tank.log`), `SELFTEST=capacity` at the refused 17th
+bucket (`-selftest-capacity.log`), `SELFTEST=transfer` at the drained channel's compound
+(`-selftest-transfer.log`), and the new `SELFTEST=channel` at the refused channel's readout
+(`-selftest-channel.log`, "expected … public / 9000 (1000 / 16000 mB …), got … empty").
+`check-e2e-logs.py dimstorage-e2e --strict` → **7/7**.
+
+Two harness facts this leg cost, both proved by probe runs:
+
+- **A crouched click never uses the bucket at this pin.** Holding shift and right-clicking the tank
+  reaches `use_item_on` (the tank's own compound is synced) but the fluid handler moves nothing, on
+  both a known and a new channel. The leg therefore clicks plainly; the mod's tank path does not read
+  the sneak state, so the scenario is the same one a player gets.
+- **A message from a block click must target the player.** `commands().feedback` is the command's
+  answer; from a click it is dropped (the first 0.2.5 in-game run printed `the player was told:
+  (nothing)`). `PlayerRef::tell` reaches the clicker, and the empty-hand readout now proves it.
+
+### Coverage (families this slice touches)
+
+| Family | Status |
+|---|---|
+| tank fill at the channel cap (new frequency) | `tested` — store grown to 4,096 `e` markers in its own format, relaunch, plain bucket click: bucket 2 → 2, tank compound `Amount:0`, readout empty, message "This world already holds as many fluid channels as it can.", channel 1 still 15,000; `SELFTEST=channel` inverts it |
+| tank fill on a known channel (the differential) | `tested` — the same click after retuning to channel 1: readout and compound 16,000, store file `t public,1 minecraft:water 16000`, still 4,096 channels and no `public,9000` |
+| refused store write (`TankWrite`/`TankTransfer`) | `tested` — `a_refused_store_write_keeps_the_tanks_own_fluid` (unit); the in-game path refuses before the handler, so the backstop is the unit's job |
+| tank readout from a click | `tested` — empty-hand click reads `public / 1 (16000 / 16000 mB of minecraft:water)` back to the player |
+| every earlier family (recipes, loot, tags, sibling sharing, frozen drain, break, persistence, commands) | `tested` — unchanged and green in the same run |
+| tank comparator, screen, waterlogging, auto-eject, lock | `not ported` — unchanged from slice 2 |
+
+### Deviations / notes this slice adds
+
+1. **The channel cap is reachable only by growing `tanks.dat`.** A player would need 4,096 distinct
+   channels; the e2e writes the mod's own `e <frequency>` marker lines, so the file stays a valid
+   store the game loads (and rewrites). Nothing is bypassed.
+2. **A refused commit keeps the fluid in the tank, not in the channel.** A foreign capability
+   transfer (a pipe) into a channel the store refuses stays visible in the tank's `fluids` and is
+   retried, never overwritten with the store's empty balance. A tank *broken* in that state still
+   loses its copy (the block and its compound go); the store never had it, and upstream has no
+   drop for it either.
+3. **A crouched click is not a tank interaction at this pin** (harness fact above); the port does
+   not branch on sneak.
+4. **The same class exists on the chest side** (`Store::set`'s refusal is ignored by the chest's
+   `sync`/`commit`); no items are destroyed there because the chest keeps showing its own stack,
+   but the channel silently does not take it. Recorded as the next slice's candidate.
+
+### Changelog text (0.2.5)
+
+> **0.2.5 — a channel the world cannot create is refused before the bucket moves.** At the store's
+> 4,096-channel cap, a fill into a new frequency is now refused whole *before* the bucket is
+> emptied: the tank keeps its contents, the bucket stays full and the player is told why. A store
+> write that is refused is reported instead of ignored, so a tank can never be overwritten with a
+> balance the store did not take, and a refused retry no longer marks the store dirty. Two
+> regression tests cover the no-room answer and the refused write; the in-game leg grows the store's
+> own file to the cap and proves the refusal beside the same click on a known channel. The refusal
+> and the tank readout reach the clicking player (they were silent from a block click). Chest
+> behaviour is unchanged; pin `0a875da` / mixins `e59da90`.
+
 Skills: superpowers/using-superpowers, brainstorming, writing-plans, test-driven-development, systematic-debugging, verification-before-completion; BeautifulRust/rust-best-practices, rust-review

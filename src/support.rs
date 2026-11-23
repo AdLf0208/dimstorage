@@ -821,6 +821,16 @@ fn channel_room(frequency: &Frequency, id: &str) -> i32 {
         .map_or(TANK_CAPACITY, |state| state.tanks.room(frequency, id))
 }
 
+/// Whether the channel may hold fluid at all: a known channel may, and a new one
+/// while the world is below its channel cap. `room` already answers zero for one it
+/// may not, so this only picks the message that tells the player the real reason.
+fn channel_admits(frequency: &Frequency) -> bool {
+    let guard = core();
+    guard
+        .as_ref()
+        .is_none_or(|state| state.tanks.admits(frequency))
+}
+
 #[mod_api::horizon_part]
 impl BlockPart for TankBlock {
     /// A bucket (or any fluid container) on the tank: empty it in, or fill it out,
@@ -887,7 +897,7 @@ fn tank_use(host: &mut dyn ServerHost, event: &mod_api::UseItemOnEvent<'_>) -> I
         TankMove::Refused(line) => {
             // A capacity refusal is decided before the handler moves anything, and
             // the click is consumed so the held bucket does not try the world.
-            say(host, line);
+            tell(host, player, line);
             return InteractionResult::Success;
         }
         TankMove::Whole | TankMove::NotFluid => {}
@@ -907,7 +917,7 @@ fn tank_use(host: &mut dyn ServerHost, event: &mod_api::UseItemOnEvent<'_>) -> I
     // An empty hand: answer with the channel's contents, the port's stand-in for
     // the deferred tank screen.
     let line = tank_readout(host, click.pos);
-    say(host, &line);
+    tell(host, player, &line);
     InteractionResult::Success
 }
 
@@ -935,6 +945,11 @@ fn tank_move(
         };
         let id = key.id(&*host);
         let amount = i32::try_from(handler.amount(host, index)).unwrap_or(i32::MAX);
+        // A channel the world cannot create has no room either, but the reason is the
+        // channel count, not this bucket: say so before the handler empties it.
+        if !channel_admits(frequency) {
+            return TankMove::Refused("This world already holds as many fluid channels as it can.");
+        }
         if amount > channel_room(frequency, &id) {
             return TankMove::Refused("The channel has no room for that much fluid.");
         }
@@ -1005,18 +1020,21 @@ fn commit_tank_at(host: &mut dyn ServerHost, level: LevelRef, pos: [i32; 3], bef
     if &after == before {
         return;
     }
-    let tank = {
+    let (tank, channel) = {
         let mut guard = core();
         let state = guard.get_or_insert_with(Core::default);
         let transfer = tank_transfer(before, &after, &mut state.tanks, &frequency);
         if transfer.committed {
             state.dirty = true;
         }
-        transfer.tank
+        // A refused write keeps the tank's own contents (never the store's empty
+        // balance); the marker stays the channel's value, so the fluid is visible and
+        // retried rather than destroyed.
+        (transfer.tank, transfer.channel)
     };
     let mut data = Compound::new();
     set_tank(&mut data, &tank);
-    set_synced(&mut data, &tank);
+    set_synced(&mut data, &channel);
     let _ = entity.merge_data(host, data);
 }
 
@@ -1611,6 +1629,13 @@ fn source_player(source: &CommandSource) -> Option<PlayerRef> {
 /// One feedback line to the command's source, vanilla's silence and track-output rules included.
 fn say(host: &mut dyn ServerHost, line: &str) {
     let _ = host.commands().feedback(Text::literal(line));
+}
+
+/// One system line to the player who clicked a block. A click is not a command, so
+/// `commands().feedback` has no source and answers nowhere; the player's own chat is
+/// where the answer belongs (learned in game on 0.2.5: the refusal was silent).
+fn tell(host: &mut dyn ServerHost, player: PlayerRef, line: &str) {
+    let _ = player.tell(host, Text::literal(line));
 }
 
 /// How many of `stack` fit into the player's main inventory, as `/give` adds them: matching

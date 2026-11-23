@@ -665,13 +665,22 @@ impl TankStore {
         self.known.len()
     }
 
+    /// Whether this frequency may hold fluid: a known channel always may, and a new
+    /// one while the store is below [`MAX_CHANNELS`]. A new one past the cap cannot
+    /// be created, so it has no room either — reporting the whole capacity for it
+    /// was the reviewer's lost-bucket case.
+    pub fn admits(&self, frequency: &Frequency) -> bool {
+        self.known.contains(frequency) || self.known.len() < MAX_CHANNELS
+    }
+
     /// Free millibuckets for `id`: the whole capacity on an empty channel, the
-    /// capacity minus what it holds when it holds that fluid, and none for
-    /// another fluid.
+    /// capacity minus what it holds when it holds that fluid, none for another
+    /// fluid, and none for a channel the store cannot admit.
     pub fn room(&self, frequency: &Frequency, id: &str) -> i32 {
         match self.tanks.get(frequency) {
             Some(held) if held.id != id => 0,
             Some(held) => TANK_CAPACITY.saturating_sub(held.amount),
+            None if !self.admits(frequency) => 0,
             None => TANK_CAPACITY,
         }
     }
@@ -683,7 +692,8 @@ impl TankStore {
             .is_some_and(|held| held.id == id && held.amount >= amount)
     }
 
-    /// Put `amount` of `id` into a channel; answers how much it took.
+    /// Put `amount` of `id` into a channel; answers how much the store really took,
+    /// which is nothing when it refused the channel.
     pub fn fill(&mut self, frequency: &Frequency, id: &str, amount: i32) -> i32 {
         let free = self.room(frequency, id);
         let taken = amount.min(free);
@@ -691,8 +701,12 @@ impl TankStore {
             return 0;
         }
         let held = self.tanks.get(frequency).map_or(0, |held| held.amount);
-        self.set(frequency, Some(TankFluid::new(id, held + taken)));
-        taken
+        let want = TankFluid::new(id, held + taken);
+        if self.set(frequency, Some(want)) {
+            taken
+        } else {
+            0
+        }
     }
 
     /// Take `amount` of `id` into a channel only when all of it fits: a fill that
@@ -885,10 +899,10 @@ pub fn tank_sync(
     } else {
         authoritative.clone()
     };
-    let store_changed = stored != authoritative;
-    if store_changed {
-        store.set(frequency, authoritative);
-    }
+    // `set` answers whether it took the value: a channel it refuses (a new one past
+    // the cap) must not make the store look changed, or every tick would save a
+    // store that did not move.
+    let store_changed = stored != authoritative && store.set(frequency, authoritative);
     TankSynced {
         tank,
         store_changed,
@@ -896,23 +910,40 @@ pub fn tank_sync(
     }
 }
 
-/// Write a tank's locally changed contents to the store; whether it changed.
+/// What writing one tank's edit to the store did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TankWrite {
+    /// The store's saved value changed.
+    pub changed: bool,
+    /// The store refused the channel: it knows [`MAX_CHANNELS`] already, so nothing
+    /// was written and the value must not be treated as stored.
+    pub refused: bool,
+}
+
+/// Write a tank's locally changed contents to the store. The answer says whether the
+/// store changed and whether it refused the channel, so a caller never mistakes a
+/// refused write for a stored value.
 pub fn tank_commit(
     local: &Tank,
     snapshot: Option<&Tank>,
     store: &mut TankStore,
     frequency: &Frequency,
-) -> bool {
+) -> TankWrite {
     let Some(snapshot) = snapshot else {
-        return false;
+        return TankWrite::default();
     };
     let stored = store.get(frequency);
     let authoritative = merged_tank(snapshot, local, &stored);
     if stored == authoritative {
-        return false;
+        return TankWrite::default();
     }
-    store.set(frequency, authoritative);
-    true
+    let changed = store.set(frequency, authoritative);
+    TankWrite {
+        changed,
+        // `set` answers false only for a new channel past the cap: an equal value was
+        // answered above, so a false here is a refusal, never "nothing to do".
+        refused: !changed,
+    }
 }
 
 /// Re-point a tank at another frequency: commit what it held to the old one,
@@ -927,7 +958,7 @@ pub fn tank_switch(
     if from == to {
         return (store.get(to), false);
     }
-    let changed = tank_commit(local, snapshot, store, from);
+    let changed = tank_commit(local, snapshot, store, from).changed;
     (store.get(to), changed)
 }
 
@@ -937,8 +968,16 @@ pub fn tank_switch(
 /// success, and `tank` is what the tank must show afterwards.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TankTransfer {
+    /// What the tank must show: the channel's value after the commit, or — when the
+    /// store refused the channel — the tank's own value, so the fluid survives.
     pub tank: Tank,
+    /// The channel's authoritative value, which is what the tank's `synced` marker
+    /// records: an empty channel stays the marker even when the tank keeps extra fluid.
+    pub channel: Tank,
+    /// The transfer reached the channel, or the channel was already known.
     pub committed: bool,
+    /// The store refused the channel, so nothing was written.
+    pub refused: bool,
 }
 
 /// Commit a capability transfer to the channel before it is reported as done.
@@ -949,10 +988,17 @@ pub fn tank_transfer(
     frequency: &Frequency,
 ) -> TankTransfer {
     let known = store.know(frequency);
-    let changed = tank_commit(after, Some(before), store, frequency);
+    let write = tank_commit(after, Some(before), store, frequency);
+    let channel = store.get(frequency);
     TankTransfer {
-        tank: store.get(frequency),
-        committed: changed | known,
+        tank: if write.refused {
+            after.clone()
+        } else {
+            channel.clone()
+        },
+        channel,
+        committed: write.changed | known,
+        refused: write.refused,
     }
 }
 
@@ -1637,5 +1683,82 @@ mod tests {
         let accepted = store.transfer_in(&Frequency::DEFAULT, "minecraft:water", 1000);
         assert!(!accepted, "a fill that does not fit is refused whole");
         assert_eq!(store.get(&Frequency::DEFAULT), water(15_500));
+    }
+
+    // -- the reviewer's channel-count case (0.2.5) --------------------------
+
+    /// A tank store that knows exactly [`MAX_CHANNELS`] channels, each holding water.
+    fn a_full_tank_store() -> TankStore {
+        let mut store = TankStore::new();
+        for channel in 0..MAX_CHANNELS {
+            let channel = i32::try_from(channel).expect("the cap fits an i32");
+            assert!(store.set(&Frequency::public(channel), water(1)));
+        }
+        assert_eq!(store.channels(), MAX_CHANNELS);
+        store
+    }
+
+    /// The first frequency past [`MAX_CHANNELS`]: one the store's `set` refuses.
+    fn one_too_many() -> Frequency {
+        Frequency::public(i32::try_from(MAX_CHANNELS).expect("the cap fits an i32"))
+    }
+
+    #[test]
+    fn a_channel_the_store_cannot_admit_has_no_room() {
+        // The reviewer's case: at the channel cap `room` reported the whole capacity
+        // for a frequency `set` then refused, so the bucket pre-check accepted a fill
+        // the store could never take. A channel the store cannot admit has no room.
+        let mut store = a_full_tank_store();
+        let refused = one_too_many();
+        assert!(
+            !store.admits(&refused),
+            "a new channel past the cap cannot be admitted"
+        );
+        assert_eq!(
+            store.room(&refused, "minecraft:water"),
+            0,
+            "a channel the store cannot admit has no room, not full capacity"
+        );
+        assert!(
+            !store.transfer_in(&refused, "minecraft:water", 1000),
+            "a fill into a channel the store cannot admit is refused whole"
+        );
+        assert_eq!(store.get(&refused), None);
+        assert_eq!(store.channels(), MAX_CHANNELS);
+        // The refusal is about admission, not about room: a known channel keeps its room.
+        assert_eq!(
+            store.room(&Frequency::public(0), "minecraft:water"),
+            TANK_CAPACITY - 1
+        );
+    }
+
+    #[test]
+    fn a_refused_store_write_keeps_the_tanks_own_fluid() {
+        // The handler already emptied the bucket into the tank's copy before the commit
+        // sees that the channel cannot be created. The commit must report that nothing
+        // was stored and must never hand the tank the store's empty balance: the tank
+        // keeps the fluid it holds, so a refused write cannot destroy it.
+        let mut store = a_full_tank_store();
+        let refused = one_too_many();
+        let transfer = tank_transfer(&None, &water(1000), &mut store, &refused);
+        assert!(
+            !transfer.committed,
+            "a store write the channel refused is not reported as committed"
+        );
+        assert!(
+            transfer.refused,
+            "the store refused the channel, so the caller knows nothing was written"
+        );
+        assert_eq!(
+            transfer.tank,
+            water(1000),
+            "the tank keeps the fluid the store did not take"
+        );
+        assert_eq!(
+            transfer.channel, None,
+            "the marker is the channel's value: the refused channel still holds nothing"
+        );
+        assert_eq!(store.get(&refused), None);
+        assert_eq!(store.channels(), MAX_CHANNELS);
     }
 }

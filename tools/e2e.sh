@@ -22,12 +22,16 @@
 #    sibling removed before its next tick, a relaunch keeps exactly the drained
 #    amount (the channel is not restored from a stale saved compound);
 #  - breaking a tank drops it into a hopper and leaves the channel's fluid intact;
-#  - both store files exist and both stores survive a relaunch.
+#  - both store files exist and both stores survive a relaunch;
+#  - at the store's channel cap, a bucket into a tank on a NEW channel is refused
+#    before the fluid moves (the tank's compound, the full bucket and the store are
+#    unchanged and the player is told why), while the same click on a known channel
+#    lands (the differential).
 #
 # SELFTEST=1 flips the chest sharing assertion; SELFTEST=tank flips the tank
 # sharing assertion; SELFTEST=capacity flips the refused-fill assertion;
-# SELFTEST=transfer flips the drain-committed assertion. Each must FAIL (EXIT:1),
-# proving the scenario can fail.
+# SELFTEST=transfer flips the drain-committed assertion; SELFTEST=channel flips the
+# channel-cap assertion. Each must FAIL (EXIT:1), proving the scenario can fail.
 #
 # A native `.hmod` cannot load on an unmodded game, so GAME must name a game
 # the launcher built with this package:
@@ -130,6 +134,23 @@ expect_tank() { expect_info "$@"; }
 # shape (`{Amount: 15000, Fluid: "minecraft:water"}`) is easy to assert on.
 tank_compound() { # tank_compound X Y Z
     ctl command "data get block $1 $2 $3 fluids" | jq -r '.chat[]?' | head -1 | tr -d ' '
+}
+# The store's channel cap, from `runtime::MAX_CHANNELS`.
+CHANNEL_CAP=4096
+# Add `e public,<n>` markers (the mod's own tank-file format for a known empty
+# channel) until the file knows exactly CHANNEL_CAP channels. The game must be
+# stopped: it loads the file at world open.
+seed_channel_cap() { # seed_channel_cap TANKS_FILE
+    local file=$1 have fill
+    have=$(grep -cE '^(t|e) ' "$file" || true)
+    fill=$((CHANNEL_CAP - have))
+    [ "$fill" -ge 0 ] || fail "the tank file already knows $have channels, over $CHANNEL_CAP"
+    if [ "$fill" -gt 0 ]; then
+        seq 0 $((fill - 1)) | awk '{print "e public," (100000 + $1)}' >>"$file"
+    fi
+    have=$(grep -cE '^(t|e) ' "$file")
+    echo "  seeded $file to $have channels (cap $CHANNEL_CAP)"
+    [ "$have" = "$CHANNEL_CAP" ] || fail "the seeded tank file knows $have channels, not $CHANNEL_CAP"
 }
 
 # Fill the tank at X Y Z from the hotbar item (a bucket), then let the store settle.
@@ -607,4 +628,105 @@ expect_tank 0 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
 expect_tank 8 100 8 "public / 2 (1000 / 16000 mB of minecraft:lava)"
 expect_tank 20 100 8 "(0 / 16000 mB, empty)"
 
-echo "PASS: the tank recipe crafted and placed, same-channel tanks shared one fluid while another channel held its own, an empty bucket drained the channel, a channel capped at 16000 mB and refused the 17th bucket before anything moved, a frozen-clock drain through one tank was committed at access and a removed stale sibling could not restore it across a relaunch (the channel read exactly 15000 mB in its own compound and in the store), a broken tank dropped into a hopper with its fluid intact, same-frequency chests shared 54 slots, a vanilla barrel never shared, and both stores survived a relaunch"
+echo "== at the channel cap, a new channel is refused before the bucket moves =="
+# The reviewer's case: at MAX_CHANNELS, `room` reported the whole capacity for a
+# frequency `set` then refused, so the bucket pre-check accepted a fill the store
+# could never take and the commit overwrote the tank with the store's empty balance.
+# The store's own file is grown to the cap behind a save (its `e public,<n>` marker
+# format), so the run reaches the limit without 4096 commands.
+ctl save >/dev/null
+ctl quit >/dev/null 2>&1 || true
+sleep 3
+seed_channel_cap "$TANKS"
+launch
+expect_tank 0 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
+# The tank at 20,100,8 moves to a channel the store has never known.
+stand 20 100 8
+say "dimstorage channel 20 100 8 9000"
+ctl wait 8
+expect_tank 20 100 8 "public / 9000 (0 / 16000 mB, empty)"
+ctl command "item replace entity @s hotbar.0 with minecraft:water_bucket 1"
+ctl wait 4
+stand 20 100 8
+cap_before=$(inv_count minecraft:water_bucket)
+echo "  water buckets before the refused click: $cap_before"
+# A plain click: at this pin a crouched click never uses the bucket on the block
+# at all (probed), so it would not exercise the refusal. The mod's tank path does
+# not read the sneak state.
+ctl select minecraft:water_bucket >/dev/null
+ctl wait 3
+ctl interact 20 100 8 >/dev/null || fail "using the water bucket on 20,100,8 failed"
+ctl wait 6
+cap_after=$(inv_count minecraft:water_bucket)
+refused_compound=$(tank_compound 20 100 8)
+told=$(ctl messages 8 | jq -r '.chat[]?')
+echo "  water buckets after the refused click: $cap_before -> $cap_after"
+echo "  the tank compound after the refused click: $refused_compound"
+echo "  the player was told: $(grep -m1 'fluid channels' <<<"$told" || echo '(nothing)')"
+if [ "$SELFTEST" = channel ]; then
+    # Deliberately wrong: the refused click did not create the channel, so the tank
+    # cannot be holding the bucket's water.
+    echo "(selftest: asserting the refused fill landed)"
+    expect_tank 20 100 8 "public / 9000 (1000 / 16000 mB of minecraft:water)"
+fi
+[ "$cap_after" = "$cap_before" ] \
+    || fail "the bucket was emptied into a channel the store cannot create ($cap_before -> $cap_after)"
+case "$refused_compound" in
+    *minecraft:water*) fail "the refused fill left water in the tank: '$refused_compound'" ;;
+esac
+grep -q 'as many fluid channels' <<<"$told" \
+    || fail "the player was not told why the fill failed: $told"
+expect_tank 20 100 8 "public / 9000 (0 / 16000 mB, empty)"
+expect_tank 0 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
+echo "  the tank holds nothing, the bucket is still full and channel 1 is unchanged"
+
+echo "== the differential: the same click on a known channel lands =="
+stand 20 100 8
+say "dimstorage channel 20 100 8 1"
+ctl wait 8
+expect_tank 20 100 8 "public / 1 (15000 / 16000 mB of minecraft:water)"
+ctl command "item replace entity @s hotbar.0 with minecraft:water_bucket 1"
+ctl wait 4
+stand 20 100 8
+ctl select minecraft:water_bucket >/dev/null
+ctl wait 3
+ctl interact 20 100 8 >/dev/null || fail "using the water bucket on the known channel failed"
+ctl wait 8
+expect_tank 20 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+expect_tank 0 100 8 "public / 1 (16000 / 16000 mB of minecraft:water)"
+landed_compound=$(tank_compound 20 100 8)
+echo "  the tank compound after the known-channel click: $landed_compound"
+case "$landed_compound" in
+    *Amount:16000*minecraft:water*|*minecraft:water*Amount:16000*) ;;
+    *) fail "the known-channel click left '$landed_compound', not 16000 of water" ;;
+esac
+ctl wait 40
+ctl save >/dev/null
+cap_lines=$(grep -cE '^(t|e) ' "$TANKS" || true)
+grep -q '^t public,1 minecraft:water 16000' "$TANKS" \
+    || fail "the tank file lost the known-channel fill: $(head -3 "$TANKS")"
+if grep -q '^[te] public,9000' "$TANKS"; then
+    fail "the refused channel was created in the store: $(grep '9000' "$TANKS" | head -3)"
+fi
+[ "$cap_lines" = "$CHANNEL_CAP" ] \
+    || fail "the seeded store knows $cap_lines channels after the run, not $CHANNEL_CAP"
+echo "  the store still knows $cap_lines channels, no public,9000, and channel 1 reads 16000"
+
+echo "== an empty-hand click reads the channel back to the player =="
+# The readout is the deferred tank screen's stand-in; it is sent to the clicker (a
+# block click is not a command, so command feedback has nowhere to go).
+ctl command "item replace entity @s hotbar.8 with minecraft:air" >/dev/null
+ctl wait 3
+ctl select 9 >/dev/null
+ctl wait 3
+[ "$(ctl state | jq -r '.held.item // "none"')" = none ] \
+    || fail "the hand still holds something, so the click would not read the tank back"
+stand 20 100 8
+click=$(ctl interact 20 100 8 2>&1) || fail "the empty-hand click on 20,100,8 failed: $click"
+ctl wait 6
+readout=$(ctl messages 4 | jq -r '.chat[]?')
+echo "  the player read back: $(grep -m1 'DimStorage tank' <<<"$readout" || echo '(nothing)')"
+grep -q 'DimStorage tank: public / 1 (16000 / 16000 mB of minecraft:water)' <<<"$readout" \
+    || fail "the empty-hand click did not read the tank back: $readout"
+
+echo "PASS: the tank recipe crafted and placed, same-channel tanks shared one fluid while another channel held its own, an empty bucket drained the channel, a channel capped at 16000 mB and refused the 17th bucket before anything moved, a frozen-clock drain through one tank was committed at access and a removed stale sibling could not restore it across a relaunch (the channel read exactly 15000 mB in its own compound and in the store), a broken tank dropped into a hopper with its fluid intact, same-frequency chests shared 54 slots, a vanilla barrel never shared, both stores survived a relaunch, and at the store's 4096-channel cap a bucket into a new channel was refused before the fluid moved (the tank empty, the bucket still full, the player told why) while the same click on a known channel landed at 16000 mB and created no channel"
